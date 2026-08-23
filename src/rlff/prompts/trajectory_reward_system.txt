@@ -1,0 +1,2 @@
+[PLACEHOLDER]
+The trajectory-level reward rubric and JSON response schema have not yet been finalized.

@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlff"
+version = "0.1.0"
+description = "Shared-policy multi-character post-training with role-level GRPO"
+readme = "RLFF.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "aiohttp>=3.13,<4",
+    "aiolimiter>=1.2,<2",
+    "diskcache>=5.6,<6",
+    "httpx>=0.28,<1",
+    "langsmith>=0.10,<0.11",
+    "openai[aiohttp]>=2.45,<3",
+    "orjson>=3.11,<4",
+    "pydantic>=2.13,<3",
+    "python-dotenv>=1.2,<2",
+    "pyyaml>=6.0,<7",
+    "rapidfuzz>=3.14,<4",
+    "tenacity>=9.1,<10",
+    "tiktoken>=0.12,<1",
+]
+
+[project.scripts]
+rlff = "rlff.cli:main"
+
+[project.optional-dependencies]
+model = [
+    "datasets>=5,<6",
+    "peft>=0.18,<0.19",
+    "safetensors>=0.8,<1",
+    "sentencepiece>=0.2,<1",
+    "transformers>=5,<6",
+]
+dev = [
+    "mypy>=2.2,<3",
+    "pytest>=9.1,<10",
+    "pytest-asyncio>=1.4,<2",
+    "ruff>=0.15,<1",
+]
+areal = [
+    # AReaL v1.0.4 is supplied from the pinned upstream checkout/container;
+    # keep the SGLang tracing wheel exact because rollout token metadata is
+    # part of RLFF's correctness boundary.
+    "sglang[tracing]==0.5.10.post1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rlff = ["prompts/*.txt", "prompts/*.md"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["RUF001"] # Chinese verifier prompts intentionally use full-width punctuation.
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["rlff"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = "diskcache"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "areal",
+    "areal.*",
+    "datasets",
+    "peft",
+    "sglang",
+    "sglang.*",
+    "torch",
+    "torch.*",
+    "transformers",
+]
+ignore_missing_imports = true

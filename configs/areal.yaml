@@ -1,0 +1,155 @@
+# Pinned AReaL v1.0.4 native configuration for the first single-GPU RLFF run.
+experiment_name: rlff-phase-d
+trial_name: trial0
+seed: 0
+total_train_epochs: 2
+tokenizer_path: models/base/Qwen2.5-7B-Instruct
+enable_offload: true
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 1
+  fileroot: outputs/areal
+  name_resolve:
+    type: nfs
+    nfs_record_root: outputs/areal/name_resolve
+
+scheduler:
+  type: null
+
+gconfig:
+  n_samples: 4
+  min_new_tokens: 0
+  max_new_tokens: 512
+  greedy: false
+  temperature: 0.9
+  lora_name: qwen2.5-7b-instruct-sft
+
+actor:
+  backend: fsdp:d1
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  path: models/base/Qwen2.5-7B-Instruct
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  optimizer:
+    type: adam
+    lr: 1.0e-5
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.0
+  eps_clip: 0.2
+  temperature: 0.9
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  reward_norm: null
+  adv_norm: null
+  discount: 1.0
+  gae_lambda: 1.0
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: false
+  use_decoupled_loss: false
+  max_new_tokens: 512
+  weight_update_mode: disk
+  use_lora: true
+  peft_type: lora
+  lora_rank: 48
+  lora_alpha: 96
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+rollout:
+  backend: sglang:d1
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  max_concurrent_rollouts: 32
+  queue_size: null
+  consumer_batch_size: 1
+  max_head_offpolicyness: 0
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  use_lora: true
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  agent:
+    agent_cls_path: rlff.runtime:RLFFGroupAwareAgent
+    mode: inline
+    turn_discount: 0.0
+    export_style: individual
+
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: bfloat16
+  max_running_requests: null
+  context_length: 8192
+  mem_fraction_static: 0.8
+  enable_lora: true
+  max_lora_rank: 48
+  enable_memory_saver: true
+
+train_dataset:
+  batch_size: 1
+  shuffle: false
+  pin_memory: true
+  num_workers: 0
+  path: data/episodes.jsonl
+  type: rl
+  max_length: 8192
+
+valid_dataset: null
+
+saver:
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+evaluator:
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

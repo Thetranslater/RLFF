@@ -1,0 +1,12 @@
+.env
+models/base/Qwen2.5-7B-Instruct/*
+!models/base/Qwen2.5-7B-Instruct/README.md
+models/adapters/qwen2.5-7b-instruct-sft/*
+!models/adapters/qwen2.5-7b-instruct-sft/README.md
+!models/adapters/qwen2.5-7b-instruct-sft/adapter_config.json
+outputs/*
+!outputs/README.md
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
