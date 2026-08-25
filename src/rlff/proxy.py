@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import math
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -64,6 +65,44 @@ class ProxyRewardProvider(Protocol):
     async def score_proxy_trajectory_role(self, payload: Mapping[str, Any]) -> float: ...
 
 
+DETERMINISTIC_AUDIT_REWARD_PROVIDER = "deterministic_audit"
+
+
+class DeterministicAuditRewardProvider:
+    """Assign deterministic trajectory-slot scores for the cloud rollout audit.
+
+    AReaL serializes workflow keyword arguments before sending them to rollout
+    workers, so the audit passes only ``reward_provider_name`` over RPC.  The
+    worker constructs this provider locally through ``_get_reward_provider``.
+    """
+
+    @staticmethod
+    def _slot(payload: Mapping[str, Any]) -> int:
+        identifiers = payload.get("ids")
+        if not isinstance(identifiers, Mapping):
+            raise ValueError("audit reward payload is missing ids")
+        trajectory_id = str(identifiers.get("trajectory_id", ""))
+        prefix, separator, slot = trajectory_id.rpartition(":trajectory:")
+        if not separator or not prefix or not slot.isdigit():
+            raise ValueError(f"cannot extract trajectory slot from {trajectory_id!r}")
+        return int(slot)
+
+    async def score_proxy_completion_role(self, payload: Mapping[str, Any]) -> dict[str, float]:
+        identifiers = payload.get("ids")
+        if not isinstance(identifiers, Mapping):
+            raise ValueError("audit completion payload is missing ids")
+        completion_ids = identifiers.get("completion_ids")
+        if not isinstance(completion_ids, Sequence) or isinstance(
+            completion_ids, (str, bytes, bytearray)
+        ):
+            raise ValueError("audit completion payload has invalid completion_ids")
+        value = float(self._slot(payload))
+        return {str(completion_id): value for completion_id in completion_ids}
+
+    async def score_proxy_trajectory_role(self, payload: Mapping[str, Any]) -> float:
+        return float(self._slot(payload))
+
+
 ProxyTrajectoryRunner = Callable[..., ProxyTrajectoryView | Awaitable[ProxyTrajectoryView]]
 
 
@@ -80,6 +119,29 @@ def _mapping_value(value: Any, key: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(key, default)
     return getattr(value, key, default)
+
+
+def decode_proxy_episode_payload(data: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Decode an episode transported either as a mapping or opaque JSON.
+
+    Hugging Face Datasets normalizes nested mapping schemas across all rows and
+    inserts null values for missing keys.  Canonical episodes are therefore
+    transported through AReaL as JSON strings so their fingerprints survive
+    the Arrow round trip unchanged.  Mapping input remains supported for the
+    direct smoke-test and unit-test paths.
+    """
+
+    raw: Any = data.get("episode", data)
+    if hasattr(raw, "model_dump"):
+        raw = raw.model_dump(mode="json")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ProxyGroupError("rollout data episode JSON is invalid") from exc
+    if not isinstance(raw, Mapping):
+        raise ProxyGroupError("rollout data episode must be a mapping or JSON object")
+    return cast(Mapping[str, Any], dict(raw))
 
 
 def normalize_proxy_role_advantages(
@@ -259,7 +321,9 @@ class RLFFGroupAwareAgent:
         trajectory_reward_retries: int | None = None,
         completion_reward_concurrency: int = 4,
         trajectory_reward_concurrency: int | None = None,
-        completion_reward_max_tokens: int = 1024,
+        completion_reward_temperature: float = 0.2,
+        trajectory_reward_temperature: float | None = None,
+        completion_reward_max_tokens: int = 15000,
         trajectory_reward_max_tokens: int | None = None,
         langsmith_tracing: bool = False,
         langsmith_project: str = "rlff",
@@ -298,6 +362,8 @@ class RLFFGroupAwareAgent:
         self._trajectory_reward_retries = trajectory_reward_retries
         self._completion_reward_concurrency = completion_reward_concurrency
         self._trajectory_reward_concurrency = trajectory_reward_concurrency
+        self._completion_reward_temperature = completion_reward_temperature
+        self._trajectory_reward_temperature = trajectory_reward_temperature
         self._completion_reward_max_tokens = completion_reward_max_tokens
         self._trajectory_reward_max_tokens = trajectory_reward_max_tokens
         self._langsmith_tracing = langsmith_tracing
@@ -382,10 +448,40 @@ class RLFFGroupAwareAgent:
                 ):
                     self._states.pop(key, None)
 
+    async def generate_trajectory(
+        self,
+        data: Mapping[str, Any],
+        *,
+        base_url: str,
+        http_client: Any = None,
+        api_key: str = "EMPTY",
+        group_id: str | None = None,
+        trajectory_id: str | None = None,
+    ) -> ProxyTrajectoryView:
+        """Generate one trajectory through the exact training rollout path.
+
+        This public boundary intentionally skips only the native group barrier,
+        DeepSeek scoring, and advantage normalization.  Prompt rendering,
+        character round-robin order, history accumulation, sampling arguments,
+        and the OpenAI-compatible transport are shared with :meth:`run`.
+        """
+
+        payload = dict(data)
+        resolved_group_id = group_id or self._group_id(payload)
+        resolved_trajectory_id = trajectory_id or f"{resolved_group_id}:trajectory:smoke"
+        return await self._run_trajectory(
+            payload,
+            base_url=base_url,
+            http_client=http_client,
+            api_key=api_key,
+            group_id=resolved_group_id,
+            trajectory_id=resolved_trajectory_id,
+        )
+
     def _group_id(self, data: Mapping[str, Any]) -> str:
         value = data.get("group_id")
         if value is None:
-            episode = data.get("episode")
+            episode = decode_proxy_episode_payload(data)
             value = _mapping_value(episode, "episode_id", "episode")
         if not isinstance(value, str) or not value.strip():
             raise ProxyGroupError("rollout data must contain a non-empty group/episode ID")
@@ -496,6 +592,9 @@ class RLFFGroupAwareAgent:
     def _get_reward_provider(self) -> ProxyRewardProvider:
         if self._reward_provider is not None:
             return self._reward_provider
+        if self._reward_provider_name == DETERMINISTIC_AUDIT_REWARD_PROVIDER:
+            self._reward_provider = DeterministicAuditRewardProvider()
+            return self._reward_provider
         if self._reward_provider_name == "placeholder":
             from .rewards import PlaceholderRewardProvider
 
@@ -533,6 +632,8 @@ class RLFFGroupAwareAgent:
                 trajectory_retries=self._trajectory_reward_retries,
                 completion_concurrency=self._completion_reward_concurrency,
                 trajectory_concurrency=self._trajectory_reward_concurrency,
+                completion_temperature=self._completion_reward_temperature,
+                trajectory_temperature=self._trajectory_reward_temperature,
                 completion_max_tokens=self._completion_reward_max_tokens,
                 trajectory_max_tokens=self._trajectory_reward_max_tokens,
                 langsmith_project=self._langsmith_project,
@@ -677,12 +778,7 @@ class RLFFGroupAwareAgent:
 
     @staticmethod
     def _episode_payload(data: Mapping[str, Any]) -> Mapping[str, Any]:
-        raw: Any = data.get("episode", data)
-        if hasattr(raw, "model_dump"):
-            raw = raw.model_dump(mode="json")
-        if not isinstance(raw, Mapping):
-            raise ProxyGroupError("rollout data episode must be a mapping")
-        return cast(Mapping[str, Any], dict(raw))
+        return decode_proxy_episode_payload(data)
 
     @staticmethod
     def _characters(episode: Mapping[str, Any]) -> tuple[str, ...]:
@@ -743,11 +839,14 @@ class RLFFGroupAwareAgent:
 
 
 __all__ = [
+    "DETERMINISTIC_AUDIT_REWARD_PROVIDER",
+    "DeterministicAuditRewardProvider",
     "ProxyCompletionView",
     "ProxyGroupError",
     "ProxyRewardProvider",
     "ProxyTrajectoryRunner",
     "ProxyTrajectoryView",
     "RLFFGroupAwareAgent",
+    "decode_proxy_episode_payload",
     "normalize_proxy_role_advantages",
 ]

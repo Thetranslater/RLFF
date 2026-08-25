@@ -15,15 +15,19 @@ cluster:
     nfs_record_root: outputs/areal/name_resolve
 
 scheduler:
-  type: null
+  # One host manages both the FSDP actor and the offloaded SGLang rollout.
+  type: local
 
 gconfig:
   n_samples: 4
   min_new_tokens: 0
   max_new_tokens: 512
   greedy: false
-  temperature: 0.9
-  lora_name: qwen2.5-7b-instruct-sft
+  temperature: 1.0
+  top_p: 0.9
+  # AReaL's OpenAI agent proxy cannot carry lora_name in the OpenAI request and
+  # therefore selects GenerationHyperparameters' default adapter name.
+  lora_name: default_lora
 
 actor:
   backend: fsdp:d1
@@ -31,9 +35,15 @@ actor:
   trial_name: trial0
   path: models/base/Qwen2.5-7B-Instruct
   init_from_scratch: false
+  # Avoid the external flash-attn package; PyTorch SDPA is the stable fallback.
+  attn_impl: sdpa
   disable_dropout: true
   gradient_checkpointing: true
   dtype: bfloat16
+  # Split the expanded multi-turn group into bounded forward/backward passes.
+  # Gradients are accumulated across these microbatches before one actor update.
+  mb_spec:
+    max_tokens_per_mb: 8192
   optimizer:
     type: adam
     lr: 1.0e-5
@@ -45,7 +55,7 @@ actor:
     gradient_clipping: 1.0
     warmup_steps_proportion: 0.0
   eps_clip: 0.2
-  temperature: 0.9
+  temperature: 1.0
   reward_scaling: 1.0
   reward_bias: 0.0
   reward_norm: null
@@ -80,7 +90,18 @@ rollout:
   consumer_batch_size: 1
   max_head_offpolicyness: 0
   enable_rollout_tracing: false
-  scheduling_spec: ${actor.scheduling_spec}
+  # The rollout RPC parent must not start inside AReaL's process-wide default
+  # TMS region. SGLang 0.5.10 creates tagged TMS regions for weights/KV cache
+  # in its own scheduler child; torch-memory-saver 0.0.9 rejects nesting those
+  # regions when TMS_INIT_ENABLE=1 is inherited from the RPC parent.
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python -m areal.infra.rpc.rpc_server
+      env_vars:
+        TMS_INIT_ENABLE: "0"
   use_lora: true
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
@@ -96,9 +117,13 @@ sglang:
   random_seed: ${seed}
   skip_tokenizer_init: true
   dtype: bfloat16
+  # Explicitly bypass FA3/FA4 after the local FlashAttention-4 kernel failure.
+  attention_backend: triton
+  sampling_backend: pytorch
   max_running_requests: null
-  context_length: 8192
-  mem_fraction_static: 0.8
+  context_length: 5120
+  # Leave enough headroom for the colocated FSDP actor during onload/update.
+  mem_fraction_static: 0.6
   enable_lora: true
   max_lora_rank: 48
   enable_memory_saver: true
@@ -110,7 +135,7 @@ train_dataset:
   num_workers: 0
   path: data/episodes.jsonl
   type: rl
-  max_length: 8192
+  max_length: 5120
 
 valid_dataset: null
 
@@ -118,17 +143,23 @@ saver:
   experiment_name: rlff-phase-d
   trial_name: trial0
   fileroot: ${cluster.fileroot}
+  # RLFF prunes completed HF/LoRA exports and retains only the newest one.
+  mode: sync
   freq_epochs: 1
-  freq_steps: null
+  freq_steps: 20
   freq_secs: null
 
 recover:
-  mode: disabled
+  # AReaL overwrites this rolling DCP checkpoint and resumes it automatically.
+  mode: auto
   experiment_name: rlff-phase-d
   trial_name: trial0
   fileroot: ${cluster.fileroot}
+  retries: 3
+  no_save_optim: false
+  no_load_optim: false
   freq_epochs: 1
-  freq_steps: null
+  freq_steps: 10
   freq_secs: null
 
 evaluator:

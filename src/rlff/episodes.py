@@ -135,7 +135,12 @@ def load_episodes(path: str | Path, *, limit: int | None = None) -> EpisodeDatas
 
 
 def _stable_integer(*parts: object) -> int:
-    return int(stable_fingerprint(parts)[:16], 16)
+    # Keep deterministic seeds inside the non-negative signed int64 domain.
+    # Hugging Face Datasets/Arrow serializes these values through a C ``long``;
+    # an unsigned 64-bit digest prefix can therefore overflow on Linux before
+    # rollout starts.  Masking the sign bit retains 63 bits of entropy while
+    # remaining valid for Arrow and downstream inference runtimes.
+    return int(stable_fingerprint(parts)[:16], 16) & ((1 << 63) - 1)
 
 
 def _normalise_templates(

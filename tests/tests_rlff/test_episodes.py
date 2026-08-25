@@ -129,6 +129,8 @@ def test_group_ids_seeds_and_render_choices_are_stable() -> None:
         {sample.trajectory_id for sample in first.samples}
     )
     assert all(sample.sampling_iteration == 1 for sample in later.samples)
+    assert 0 <= first.samples[0].render.render_seed < 2**63
+    assert all(0 <= sample.seed < 2**63 for sample in first.samples)
 
 
 def test_target_projection_matches_sft_role_merge_and_hides_other_tasks() -> None:

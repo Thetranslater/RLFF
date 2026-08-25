@@ -321,6 +321,10 @@ async def test_deepseek_http_retry_and_scope_specific_payload_messages() -> None
     assert set(trajectory_body) == {"history"}
     assert "角色=Alice" in transport.calls[1]["payload"]["messages"][0]["content"]
     assert "alice-secret" in transport.calls[2]["payload"]["messages"][0]["content"]
+    assert transport.calls[1]["payload"]["temperature"] == 0.2
+    assert transport.calls[2]["payload"]["temperature"] == 0.2
+    assert transport.calls[1]["payload"]["max_tokens"] == 15000
+    assert transport.calls[2]["payload"]["max_tokens"] == 15000
 
 
 @pytest.mark.asyncio

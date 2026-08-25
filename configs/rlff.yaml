@@ -18,10 +18,10 @@ rollout:
 sglang:
   model: models/base/Qwen2.5-7B-Instruct
   base_url: http://127.0.0.1:30000
-  temperature: 0.9
-  top_p: 1.0
+  temperature: 1.0
+  top_p: 0.9
   max_new_tokens: 512
-  context_length: 8192
+  context_length: 5120
   timeout_seconds: 120.0
 
 rewards:
@@ -31,14 +31,16 @@ rewards:
     timeout_seconds: 120.0
     retries: 2
     concurrency: 4
-    max_tokens: 1024
+    temperature: 0.2
+    max_tokens: 15000
   global_reward:
     model: deepseek-v4-flash
     prompt_path: prompts/trajectory_reward_system.txt
     timeout_seconds: 120.0
     retries: 2
     concurrency: 4
-    max_tokens: 1024
+    temperature: 0.2
+    max_tokens: 15000
   completion_weight: 0.6
   global_weight: 0.4
   provider: deepseek

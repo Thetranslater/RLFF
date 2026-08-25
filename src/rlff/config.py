@@ -166,13 +166,21 @@ class RewardScopeConfig(ConfigModel):
     timeout_seconds: StrictFloat = 120.0
     retries: _NON_NEGATIVE_INT = 2
     concurrency: _POSITIVE_INT = 4
-    max_tokens: _POSITIVE_INT = 1024
+    temperature: StrictFloat = 0.2
+    max_tokens: _POSITIVE_INT = 15000
 
     @field_validator("timeout_seconds")
     @classmethod
     def timeout_is_positive(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("reward timeout_seconds must be positive")
+        return value
+
+    @field_validator("temperature")
+    @classmethod
+    def temperature_is_supported(cls, value: float) -> float:
+        if not 0 <= value <= 2:
+            raise ValueError("reward temperature must be between 0 and 2")
         return value
 
 

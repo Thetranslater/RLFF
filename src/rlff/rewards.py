@@ -1128,7 +1128,9 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         trajectory_retries: int | None = None,
         completion_concurrency: int = 4,
         trajectory_concurrency: int | None = None,
-        completion_max_tokens: int = 1024,
+        completion_temperature: float = 0.2,
+        trajectory_temperature: float | None = None,
+        completion_max_tokens: int = 15000,
         trajectory_max_tokens: int | None = None,
         transport: RewardTransportCallable | RewardTransport | None = None,
         tracer: Any = None,
@@ -1162,6 +1164,8 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             trajectory_retries = int(trajectory_scope.retries)
             completion_concurrency = int(completion_scope.concurrency)
             trajectory_concurrency = int(trajectory_scope.concurrency)
+            completion_temperature = float(completion_scope.temperature)
+            trajectory_temperature = float(trajectory_scope.temperature)
             completion_max_tokens = int(completion_scope.max_tokens)
             trajectory_max_tokens = int(trajectory_scope.max_tokens)
             model = str(completion_scope.model)
@@ -1224,6 +1228,10 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             trajectory_concurrency is not None and trajectory_concurrency <= 0
         ):
             raise ValueError("reward concurrency must be positive")
+        if not 0 <= completion_temperature <= 2 or (
+            trajectory_temperature is not None and not 0 <= trajectory_temperature <= 2
+        ):
+            raise ValueError("reward temperature must be between 0 and 2")
         if completion_max_tokens <= 0 or (
             trajectory_max_tokens is not None and trajectory_max_tokens <= 0
         ):
@@ -1242,6 +1250,12 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         self._completion_retries = int(completion_retries)
         self._trajectory_retries = int(
             trajectory_retries if trajectory_retries is not None else completion_retries
+        )
+        self._completion_temperature = float(completion_temperature)
+        self._trajectory_temperature = float(
+            trajectory_temperature
+            if trajectory_temperature is not None
+            else completion_temperature
         )
         self._completion_max_tokens = int(completion_max_tokens)
         self._trajectory_max_tokens = int(
@@ -1562,7 +1576,11 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         request_payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "temperature": 0.0,
+            "temperature": (
+                self._completion_temperature
+                if scope == "completion_local"
+                else self._trajectory_temperature
+            ),
             "max_tokens": int(
                 self._completion_max_tokens
                 if scope == "completion_local"

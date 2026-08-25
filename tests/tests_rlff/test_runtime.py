@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 import rlff.runtime as runtime
 from rlff.cli import main
@@ -18,6 +19,7 @@ from rlff.proxy import (
     ProxyGroupError,
     ProxyTrajectoryView,
     RLFFGroupAwareAgent,
+    decode_proxy_episode_payload,
     normalize_proxy_role_advantages,
 )
 
@@ -42,13 +44,18 @@ def _write_runtime_files(tmp_path: Path) -> tuple[RLFFConfig, Path]:
     areal_yaml = tmp_path / "areal.yaml"
     areal_yaml.write_text(
         """
+scheduler:
+  type: local
 gconfig:
   n_samples: 4
   temperature: 0.9
+  top_p: 1.0
   max_new_tokens: 8
+  lora_name: default_lora
 actor:
   backend: fsdp:d1
   path: base-model
+  attn_impl: sdpa
   use_lora: true
   peft_type: lora
   lora_rank: 8
@@ -66,11 +73,21 @@ actor:
   discount: 1.0
   gae_lambda: 1.0
 rollout:
+  use_lora: true
+  scheduling_spec:
+    - env_vars:
+        TMS_INIT_ENABLE: "0"
   agent:
     agent_cls_path: rlff.runtime:RLFFGroupAwareAgent
     mode: inline
     turn_discount: 0.0
     export_style: individual
+sglang:
+  attention_backend: triton
+  sampling_backend: pytorch
+  context_length: 32
+train_dataset:
+  max_length: 32
 """,
         encoding="utf-8",
     )
@@ -111,6 +128,59 @@ def test_runtime_plan_checks_adapter_and_native_constraints(tmp_path: Path) -> N
     assert plan.environment[runtime.AREAL_ADAPTER_ENV].endswith("sft-adapter")
 
 
+def test_agent_workflow_kwargs_include_reward_sampling_settings(tmp_path: Path) -> None:
+    config, _ = _write_runtime_files(tmp_path)
+
+    kwargs = runtime.build_agent_workflow_kwargs(config)
+
+    assert kwargs["completion_reward_temperature"] == 0.2
+    assert kwargs["trajectory_reward_temperature"] == 0.2
+    assert kwargs["completion_reward_max_tokens"] == 15000
+    assert kwargs["trajectory_reward_max_tokens"] == 15000
+
+
+def test_runtime_plan_rejects_nondefault_proxy_lora_name(
+    tmp_path: Path,
+) -> None:
+    config, areal_yaml = _write_runtime_files(tmp_path)
+    payload = yaml.safe_load(areal_yaml.read_text(encoding="utf-8"))
+    payload["gconfig"]["lora_name"] = "named-adapter"
+    areal_yaml.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(runtime.RuntimeCompatibilityError, match="lora_name"):
+        runtime.build_runtime_plan(config)
+
+
+def test_runtime_plan_rejects_missing_local_scheduler(tmp_path: Path) -> None:
+    config, areal_yaml = _write_runtime_files(tmp_path)
+    payload = yaml.safe_load(areal_yaml.read_text(encoding="utf-8"))
+    payload["scheduler"]["type"] = None
+    areal_yaml.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(runtime.RuntimeCompatibilityError, match=r"scheduler\.type"):
+        runtime.build_runtime_plan(config)
+
+
+def test_runtime_plan_rejects_lora_name_under_rollout(tmp_path: Path) -> None:
+    config, areal_yaml = _write_runtime_files(tmp_path)
+    payload = yaml.safe_load(areal_yaml.read_text(encoding="utf-8"))
+    payload["rollout"]["lora_name"] = "default_lora"
+    areal_yaml.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(runtime.RuntimeCompatibilityError, match="only under gconfig"):
+        runtime.build_runtime_plan(config)
+
+
+def test_runtime_plan_requires_rollout_tms_parent_disabled(tmp_path: Path) -> None:
+    config, areal_yaml = _write_runtime_files(tmp_path)
+    payload = yaml.safe_load(areal_yaml.read_text(encoding="utf-8"))
+    payload["rollout"]["scheduling_spec"][0]["env_vars"] = {}
+    areal_yaml.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(runtime.RuntimeCompatibilityError, match="TMS_INIT_ENABLE"):
+        runtime.build_runtime_plan(config)
+
+
 def test_runtime_plan_treats_target_modules_as_unordered(tmp_path: Path) -> None:
     config, _ = _write_runtime_files(tmp_path)
     path = Path(config.lora.sft_adapter_path) / "adapter_config.json"
@@ -135,9 +205,7 @@ def test_disable_dropout_modules_includes_lora_modules() -> None:
 
     assert count == 2
     assert all(
-        module.p == 0.0
-        for module in model.modules()
-        if isinstance(module, torch.nn.Dropout)
+        module.p == 0.0 for module in model.modules() if isinstance(module, torch.nn.Dropout)
     )
 
 
@@ -193,6 +261,95 @@ def test_runtime_import_is_cpu_only_and_lazy() -> None:
         text=True,
     )
     assert json.loads(completed.stdout) == {"areal": False, "torch": False}
+
+
+def test_prune_old_hf_checkpoints_keeps_latest_and_recovery_state(
+    tmp_path: Path,
+) -> None:
+    model_root = tmp_path / "default"
+    model_root.mkdir()
+    oldest = model_root / "epoch0epochstep19globalstep19"
+    middle = model_root / "epoch0epochstep39globalstep39"
+    newest = model_root / "epoch1epochstep9globalstep209"
+    recover = model_root / "recover_checkpoint"
+    unrelated = model_root / "manual-export"
+    for directory in (oldest, middle, newest, recover, unrelated):
+        directory.mkdir()
+        (directory / "marker").write_text(directory.name, encoding="utf-8")
+
+    removed = runtime.prune_old_hf_checkpoints(model_root)
+
+    assert removed == (oldest, middle)
+    assert newest.is_dir()
+    assert recover.is_dir()
+    assert unrelated.is_dir()
+
+
+def test_prune_old_hf_checkpoints_rejects_deleting_every_export(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        runtime.prune_old_hf_checkpoints(tmp_path, keep=0)
+
+
+def test_areal_dataset_preserves_episode_fingerprint_across_arrow(tmp_path: Path) -> None:
+    pytest.importorskip("datasets")
+    config, _ = _write_runtime_files(tmp_path)
+    first = EpisodeRecord(
+        title="first",
+        plot="First plot.",
+        characters=[{"name": "Alice"}, {"name": "Bob"}],
+        metadata={"book": "demo", "source": "first"},
+    )
+    second = EpisodeRecord(
+        title="second",
+        plot="Second plot.",
+        characters=[{"name": "Alice"}, {"name": "Bob"}],
+        metadata={"book": "demo", "plot_index": 2},
+    )
+    config.episode_grouping.dataset_path.write_text(
+        "".join(
+            json.dumps(record.model_dump(mode="json"), ensure_ascii=False) + "\n"
+            for record in (first, second)
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = runtime.build_areal_training_dataset(config)
+    assert isinstance(dataset[0]["episode"], str)
+    round_tripped = EpisodeRecord.model_validate(decode_proxy_episode_payload(dataset[0]))
+
+    assert round_tripped.fingerprint == first.fingerprint
+    assert round_tripped.metadata == first.metadata
+
+
+def test_areal_dataset_preflights_every_character_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _ = _write_runtime_files(tmp_path)
+    record = EpisodeRecord(
+        title="prompt preflight",
+        plot="A plot.",
+        characters=[{"name": "Alice"}, {"name": "Bob"}],
+    )
+    config.episode_grouping.dataset_path.write_text(
+        json.dumps(record.model_dump(mode="json")) + "\n",
+        encoding="utf-8",
+    )
+    seen: list[str] = []
+
+    def project(record: EpisodeRecord, character: str, **kwargs: Any) -> object:
+        _ = record, kwargs
+        seen.append(character)
+        return object()
+
+    import rlff.episodes as episodes
+
+    monkeypatch.setattr(episodes, "project_target_prompt", project)
+    runtime.build_areal_training_dataset(config)
+
+    assert seen == ["Alice", "Bob"]
 
 
 def test_role_advantage_tensor_data_broadcasts_only_completion_tokens() -> None:
@@ -287,9 +444,7 @@ def test_group_agent_barrier_returns_only_own_session_rewards() -> None:
             self.completion_calls: list[str] = []
             self.trajectory_calls: list[str] = []
 
-        async def score_proxy_completion_role(
-            self, payload: dict[str, Any]
-        ) -> dict[str, float]:
+        async def score_proxy_completion_role(self, payload: dict[str, Any]) -> dict[str, float]:
             completion_ids = [str(value) for value in payload["ids"]["completion_ids"]]
             self.completion_calls.extend(completion_ids)
             return {
@@ -393,13 +548,8 @@ def test_group_agent_barrier_failure_fails_every_run() -> None:
         )
 
     class ZeroProvider:
-        async def score_proxy_completion_role(
-            self, payload: dict[str, Any]
-        ) -> dict[str, float]:
-            return {
-                str(completion_id): 0.0
-                for completion_id in payload["ids"]["completion_ids"]
-            }
+        async def score_proxy_completion_role(self, payload: dict[str, Any]) -> dict[str, float]:
+            return {str(completion_id): 0.0 for completion_id in payload["ids"]["completion_ids"]}
 
         async def score_proxy_trajectory_role(self, payload: dict[str, Any]) -> float:
             return 0.0
@@ -427,6 +577,39 @@ def test_group_agent_barrier_failure_fails_every_run() -> None:
 
     results = asyncio.run(execute())
     assert all(isinstance(result, ProxyGroupError) for result in results)
+
+
+def test_public_generate_trajectory_uses_training_runner_without_reward_barrier() -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def run_trajectory(data: dict[str, Any], **kwargs: Any) -> ProxyTrajectoryView:
+        calls.append({"data": data, **kwargs})
+        return ProxyTrajectoryView(
+            group_id=str(kwargs["group_id"]),
+            trajectory_id=str(kwargs["trajectory_id"]),
+            episode_id="episode-1",
+            episode={"episode_id": "episode-1", "plot": "test", "characters": []},
+            completions=(),
+            turns=(),
+            planned_rounds=1,
+            completed_rounds=1,
+        )
+
+    agent = RLFFGroupAwareAgent(group_size=4, trajectory_runner=run_trajectory)
+    result = asyncio.run(
+        agent.generate_trajectory(
+            {"group_id": "group-1", "episode": {"episode_id": "episode-1"}},
+            base_url="http://sglang/v1",
+            http_client=object(),
+            api_key="EMPTY",
+            trajectory_id="trajectory-smoke",
+        )
+    )
+
+    assert result.trajectory_id == "trajectory-smoke"
+    assert len(calls) == 1
+    assert calls[0]["group_id"] == "group-1"
+    assert calls[0]["max_rounds"] == 1
 
 
 def test_proxy_prompt_uses_canonical_target_projection() -> None:

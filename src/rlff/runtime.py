@@ -20,7 +20,10 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import logging
 import os
+import re
+import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib import metadata
@@ -30,12 +33,31 @@ from typing import Any, Final, cast
 import yaml
 
 from .config import AREAL_COMMIT, AREAL_VERSION, SGLANG_VERSION, RLFFConfig
+from .contracts import canonical_json
 from .proxy import RLFFGroupAwareAgent
 
 AREAL_ADAPTER_ENV: Final[str] = "RLFF_SFT_ADAPTER_PATH"
 """Environment variable propagated to every actor AReaL worker."""
 
 AREAL_VERSION_TAG: Final[str] = "areal-v1.0.4"
+
+AREAL_PROXY_LORA_NAME: Final[str] = "default_lora"
+"""LoRA selector required by AReaL v1.0.4's OpenAI agent proxy.
+
+The proxy converts OpenAI requests back into AReaL generation parameters.  The
+OpenAI request schema cannot carry ``lora_name``, so that conversion uses
+``GenerationHyperparameters``' default selector.  The rollout server must load
+the trainable adapter under the same name (with AReaL's ``-vN`` suffix).
+"""
+
+HF_CHECKPOINTS_TO_KEEP: Final[int] = 1
+"""Number of versioned Hugging Face/LoRA exports retained per model."""
+
+_HF_CHECKPOINT_DIR = re.compile(
+    r"^epoch(?P<epoch>\d+)epochstep(?P<epoch_step>\d+)globalstep(?P<global_step>\d+)$"
+)
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeCompatibilityError(RuntimeError):
@@ -52,6 +74,54 @@ class AReaLUnavailableError(RuntimeCompatibilityError):
 
 class ProxyWorkflowUnavailableError(RuntimeCompatibilityError):
     """Raised when the pinned official agent-like proxy path is unavailable."""
+
+
+def prune_old_hf_checkpoints(
+    model_save_root: str | Path,
+    *,
+    keep: int = HF_CHECKPOINTS_TO_KEEP,
+) -> tuple[Path, ...]:
+    """Delete old versioned HF exports while preserving recovery state.
+
+    AReaL writes ordinary evaluation exports to directories named
+    ``epoch{n}epochstep{n}globalstep{n}``, but writes resumable DCP state to
+    the fixed ``recover_checkpoint`` directory. Matching the complete HF
+    directory name keeps cleanup deliberately narrow: recovery state, logs,
+    metadata, and unrelated user files are never candidates.
+
+    The caller invokes this only after AReaL's synchronous save and recovery
+    barriers complete, so the newest export is fully written before an older
+    one is removed.
+    """
+
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
+    root = Path(model_save_root)
+    if not root.is_dir():
+        return ()
+
+    checkpoints: list[tuple[tuple[int, int, int], Path]] = []
+    for child in root.iterdir():
+        match = _HF_CHECKPOINT_DIR.fullmatch(child.name)
+        if match is None or not child.is_dir():
+            continue
+        checkpoints.append(
+            (
+                (
+                    int(match.group("global_step")),
+                    int(match.group("epoch")),
+                    int(match.group("epoch_step")),
+                ),
+                child,
+            )
+        )
+
+    checkpoints.sort(key=lambda item: item[0])
+    removed: list[Path] = []
+    for _order, checkpoint in checkpoints[:-keep]:
+        shutil.rmtree(checkpoint)
+        removed.append(checkpoint)
+    return tuple(removed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,11 +376,8 @@ def inspect_sft_adapter(
             raise AdapterPreflightError(
                 "existing adapter alpha does not match official AReaL actor.lora_alpha"
             )
-        if (
-            yaml_constraints.actor_target_modules is not None
-            and not _same_target_modules(
-                targets, yaml_constraints.actor_target_modules
-            )
+        if yaml_constraints.actor_target_modules is not None and not _same_target_modules(
+            targets, yaml_constraints.actor_target_modules
         ):
             raise AdapterPreflightError(
                 "existing adapter target_modules do not match official AReaL actor.target_modules"
@@ -393,8 +460,21 @@ def validate_areal_yaml(
                 f"official AReaL YAML {label} must be {expected!r}, found {value!r}"
             )
 
+    scheduler = _nested(raw, "scheduler")
+    if not isinstance(scheduler, Mapping) or scheduler.get("type") != "local":
+        raise RuntimeCompatibilityError(
+            "official AReaL scheduler.type must be 'local' for the single-node "
+            "single-controller RLFF runtime"
+        )
+
     require_exact(("gconfig", "n_samples"), config.areal.native_n_samples, "gconfig.n_samples")
     require_exact(("gconfig", "temperature"), config.sglang.temperature, "gconfig.temperature")
+    require_exact(("gconfig", "top_p"), config.sglang.top_p, "gconfig.top_p")
+    require_exact(
+        ("gconfig", "lora_name"),
+        AREAL_PROXY_LORA_NAME,
+        "gconfig.lora_name for the AReaL OpenAI agent proxy",
+    )
     require_exact(
         ("gconfig", "max_new_tokens"),
         config.sglang.max_new_tokens,
@@ -426,6 +506,10 @@ def validate_areal_yaml(
         raise RuntimeCompatibilityError(
             "official AReaL actor.temperature must match rollout temperature"
         )
+    if actor.get("attn_impl") != "sdpa":
+        raise RuntimeCompatibilityError(
+            "official AReaL actor.attn_impl must be 'sdpa' to bypass external FlashAttention"
+        )
     if actor.get("kl_ctl") != 0.0:
         raise RuntimeCompatibilityError(
             "official AReaL actor.kl_ctl must be 0.0; RLFF disables KL shaping"
@@ -451,7 +535,58 @@ def validate_areal_yaml(
     if isinstance(actor.get("peft_type"), str) and actor["peft_type"].casefold() != "lora":
         raise RuntimeCompatibilityError("official AReaL actor.peft_type must be lora")
 
-    agent = _nested(raw, "rollout", "agent")
+    sglang = _nested(raw, "sglang")
+    if not isinstance(sglang, Mapping):
+        raise RuntimeCompatibilityError("official AReaL YAML must define sglang")
+    if sglang.get("attention_backend") != "triton":
+        raise RuntimeCompatibilityError(
+            "official AReaL sglang.attention_backend must be 'triton' to bypass FA3/FA4"
+        )
+    if sglang.get("sampling_backend") != "pytorch":
+        raise RuntimeCompatibilityError(
+            "official AReaL sglang.sampling_backend must be 'pytorch' to bypass FlashInfer"
+        )
+    if sglang.get("context_length") != config.sglang.context_length:
+        raise RuntimeCompatibilityError(
+            "official AReaL sglang.context_length must match RLFF context_length"
+        )
+
+    train_dataset = _nested(raw, "train_dataset")
+    if not isinstance(train_dataset, Mapping):
+        raise RuntimeCompatibilityError("official AReaL YAML must define train_dataset")
+    if train_dataset.get("max_length") != config.sglang.context_length:
+        raise RuntimeCompatibilityError(
+            "official AReaL train_dataset.max_length must match RLFF context_length"
+        )
+
+    rollout = _nested(raw, "rollout")
+    if not isinstance(rollout, Mapping):
+        raise RuntimeCompatibilityError("official AReaL YAML must define rollout")
+    if "lora_name" in rollout:
+        raise RuntimeCompatibilityError(
+            "official AReaL rollout must not define lora_name; AReaL v1.0.4 "
+            "accepts it only under gconfig"
+        )
+    if rollout.get("use_lora") is not True:
+        raise RuntimeCompatibilityError("official AReaL rollout.use_lora must be true")
+    rollout_specs = rollout.get("scheduling_spec")
+    if not isinstance(rollout_specs, list) or not rollout_specs:
+        raise RuntimeCompatibilityError(
+            "official AReaL rollout.scheduling_spec must define the rollout RPC worker"
+        )
+    for index, spec in enumerate(rollout_specs):
+        if not isinstance(spec, Mapping):
+            raise RuntimeCompatibilityError(
+                f"official AReaL rollout.scheduling_spec[{index}] must be a mapping"
+            )
+        env_vars = spec.get("env_vars")
+        if not isinstance(env_vars, Mapping) or str(env_vars.get("TMS_INIT_ENABLE")) != "0":
+            raise RuntimeCompatibilityError(
+                "official AReaL rollout scheduling workers must set "
+                "TMS_INIT_ENABLE='0' to avoid nested torch-memory-saver regions"
+            )
+
+    agent = rollout.get("agent")
     if not isinstance(agent, Mapping):
         raise RuntimeCompatibilityError("official AReaL rollout.agent is required")
     if agent.get("mode") != config.areal.proxy_mode:
@@ -676,6 +811,34 @@ def _build_areal_runtime_classes() -> tuple[Any, Any]:
             self._ensure_proxy_started()
         return base_trainer.train(self, *args, workflow=workflow, **kwargs)
 
+    def trainer_save_recover_checkpoint(
+        self: Any,
+        epoch: int,
+        epoch_step: int,
+        global_step: int,
+    ) -> None:
+        """Save recoverable state, then retain only the newest LoRA export."""
+
+        base_trainer._save_recover_checkpoint(
+            self,
+            epoch=epoch,
+            epoch_step=epoch_step,
+            global_step=global_step,
+        )
+        saver_config = self.saver.config
+        saver_class = type(self.saver)
+        model_names = ("default", "critic") if self.critic is not None else ("default",)
+        for model_name in model_names:
+            model_root = saver_class.get_model_save_root(
+                saver_config.experiment_name,
+                saver_config.trial_name,
+                saver_config.fileroot,
+                name=model_name,
+            )
+            removed = prune_old_hf_checkpoints(model_root)
+            for checkpoint in removed:
+                logger.info("Removed superseded HF checkpoint: %s", checkpoint)
+
     trainer_class = type(
         "RLFFPPOTrainer",
         (base_trainer,),
@@ -684,6 +847,7 @@ def _build_areal_runtime_classes() -> tuple[Any, Any]:
             "__doc__": "Pinned AReaL trainer selecting the RLFF FSDP actor.",
             "__init__": trainer_init,
             "_create_train_engine": trainer_create_train_engine,
+            "_save_recover_checkpoint": trainer_save_recover_checkpoint,
             "train": trainer_train,
         },
     )
@@ -729,7 +893,7 @@ def build_areal_training_dataset(config: RLFFConfig) -> Any:
         raise AReaLUnavailableError(
             "datasets is required to build the AReaL training dataset"
         ) from exc
-    from .episodes import build_episode_group, load_episode_jsonl
+    from .episodes import build_episode_group, load_episode_jsonl, project_target_prompt
 
     loaded = load_episode_jsonl(
         config.episode_grouping.dataset_path,
@@ -745,12 +909,24 @@ def build_areal_training_dataset(config: RLFFConfig) -> Any:
             templates=templates,
         )
         render = group.samples[0].render
+        # Exercise the exact worker-side renderer before allocating actor or
+        # rollout models. This catches missing packaged renderer code, invalid
+        # template variables, and character projection failures during preflight.
+        for character in group.episode.characters:
+            project_target_prompt(
+                group.episode,
+                character.name,
+                render=render,
+            )
         rows.append(
             {
                 "episode_id": group.episode_id,
                 "group_id": group.group_id,
                 "render": render.model_dump(mode="json"),
-                "episode": group.episode.model_dump(mode="json", exclude_none=True),
+                # Keep the canonical episode opaque to Arrow.  Dataset.from_list
+                # otherwise unions arbitrary metadata keys across rows and adds
+                # null fields, invalidating the embedded content fingerprint.
+                "episode": canonical_json(group.episode),
             }
         )
     if not rows:
@@ -758,7 +934,7 @@ def build_areal_training_dataset(config: RLFFConfig) -> Any:
     return Dataset.from_list(rows)
 
 
-def _default_agent_workflow_kwargs(config: RLFFConfig) -> dict[str, Any]:
+def build_agent_workflow_kwargs(config: RLFFConfig) -> dict[str, Any]:
     """Translate RLFF-owned rollout/reward settings to the agent constructor."""
 
     return {
@@ -786,6 +962,8 @@ def _default_agent_workflow_kwargs(config: RLFFConfig) -> dict[str, Any]:
         "trajectory_reward_retries": config.rewards.global_reward.retries,
         "completion_reward_concurrency": config.rewards.completion.concurrency,
         "trajectory_reward_concurrency": config.rewards.global_reward.concurrency,
+        "completion_reward_temperature": config.rewards.completion.temperature,
+        "trajectory_reward_temperature": config.rewards.global_reward.temperature,
         "completion_reward_max_tokens": config.rewards.completion.max_tokens,
         "trajectory_reward_max_tokens": config.rewards.global_reward.max_tokens,
         "langsmith_tracing": config.observability.langsmith_tracing,
@@ -813,7 +991,7 @@ def run_training(
     if train_dataset is None:
         train_dataset = build_areal_training_dataset(config)
     if workflow is RLFFGroupAwareAgent:
-        merged_workflow_kwargs = _default_agent_workflow_kwargs(config)
+        merged_workflow_kwargs = build_agent_workflow_kwargs(config)
         if workflow_kwargs:
             merged_workflow_kwargs.update(workflow_kwargs)
         workflow_kwargs = merged_workflow_kwargs
@@ -879,6 +1057,7 @@ __all__ = [
     "RuntimeCompatibilityError",
     "RuntimePlan",
     "apply_existing_sft_adapter",
+    "build_agent_workflow_kwargs",
     "build_areal_training_dataset",
     "build_runtime_plan",
     "describe_runtime_plan",
