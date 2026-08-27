@@ -60,8 +60,8 @@ def test_config_hierarchy_defaults_and_non_secret_snapshot(
     assert config.rewards.global_reward.model == "deepseek-v4-flash"
     assert config.rewards.completion.temperature == 1.0
     assert config.rewards.global_reward.temperature == 1.0
-    assert config.rewards.completion.reasoning_effort == "high"
-    assert config.rewards.global_reward.reasoning_effort == "high"
+    assert config.rewards.completion.reasoning_effort == "low"
+    assert config.rewards.global_reward.reasoning_effort == "low"
     assert config.rewards.completion.max_tokens == 25000
     assert config.rewards.global_reward.max_tokens == 25000
     assert config.lora.dtype == "bfloat16"

@@ -32,7 +32,7 @@ rewards:
     retries: 2
     concurrency: 4
     temperature: 1.0
-    reasoning_effort: high
+    reasoning_effort: low
     max_tokens: 25000
   global_reward:
     model: deepseek-v4-flash
@@ -41,7 +41,7 @@ rewards:
     retries: 2
     concurrency: 4
     temperature: 1.0
-    reasoning_effort: high
+    reasoning_effort: low
     max_tokens: 25000
   completion_weight: 0.6
   global_weight: 0.4

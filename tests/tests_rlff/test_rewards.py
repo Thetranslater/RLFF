@@ -339,8 +339,8 @@ async def test_deepseek_http_retry_and_scope_specific_payload_messages() -> None
     assert "alice-secret" in transport.calls[2]["payload"]["messages"][0]["content"]
     assert transport.calls[1]["payload"]["temperature"] == 1.0
     assert transport.calls[2]["payload"]["temperature"] == 1.0
-    assert transport.calls[1]["payload"]["reasoning_effort"] == "high"
-    assert transport.calls[2]["payload"]["reasoning_effort"] == "high"
+    assert transport.calls[1]["payload"]["reasoning_effort"] == "low"
+    assert transport.calls[2]["payload"]["reasoning_effort"] == "low"
     assert transport.calls[1]["payload"]["max_tokens"] == 25000
     assert transport.calls[2]["payload"]["max_tokens"] == 25000
 

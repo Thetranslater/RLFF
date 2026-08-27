@@ -167,7 +167,7 @@ class RewardScopeConfig(ConfigModel):
     retries: _NON_NEGATIVE_INT = 2
     concurrency: _POSITIVE_INT = 4
     temperature: StrictFloat = 1.0
-    reasoning_effort: Literal["low", "medium", "high", "max"] = "high"
+    reasoning_effort: Literal["low", "medium", "high", "max"] = "low"
     max_tokens: _POSITIVE_INT = 25000
 
     @field_validator("timeout_seconds")

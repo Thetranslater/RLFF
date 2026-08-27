@@ -323,7 +323,7 @@ class RLFFGroupAwareAgent:
         trajectory_reward_concurrency: int | None = None,
         completion_reward_temperature: float = 1.0,
         trajectory_reward_temperature: float | None = None,
-        completion_reward_reasoning_effort: str = "high",
+        completion_reward_reasoning_effort: str = "low",
         trajectory_reward_reasoning_effort: str | None = None,
         completion_reward_max_tokens: int = 25000,
         trajectory_reward_max_tokens: int | None = None,

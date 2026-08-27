@@ -1162,7 +1162,7 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         trajectory_concurrency: int | None = None,
         completion_temperature: float = 1.0,
         trajectory_temperature: float | None = None,
-        completion_reasoning_effort: str = "high",
+        completion_reasoning_effort: str = "low",
         trajectory_reasoning_effort: str | None = None,
         completion_max_tokens: int = 25000,
         trajectory_max_tokens: int | None = None,
