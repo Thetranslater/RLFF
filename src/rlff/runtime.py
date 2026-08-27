@@ -964,6 +964,8 @@ def build_agent_workflow_kwargs(config: RLFFConfig) -> dict[str, Any]:
         "trajectory_reward_concurrency": config.rewards.global_reward.concurrency,
         "completion_reward_temperature": config.rewards.completion.temperature,
         "trajectory_reward_temperature": config.rewards.global_reward.temperature,
+        "completion_reward_reasoning_effort": config.rewards.completion.reasoning_effort,
+        "trajectory_reward_reasoning_effort": config.rewards.global_reward.reasoning_effort,
         "completion_reward_max_tokens": config.rewards.completion.max_tokens,
         "trajectory_reward_max_tokens": config.rewards.global_reward.max_tokens,
         "langsmith_tracing": config.observability.langsmith_tracing,

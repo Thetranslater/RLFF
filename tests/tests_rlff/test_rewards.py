@@ -25,6 +25,7 @@ from rlff.rewards import (
     aggregate_role_rewards,
     build_completion_reward_payload,
     build_trajectory_reward_payload,
+    completion_response_rewards,
     load_reward_prompt,
     parse_completion_reward_response,
     parse_reward_response,
@@ -148,6 +149,21 @@ def test_response_schema_is_strict_and_has_no_state_fields() -> None:
         parse_completion_reward_response({"scores": [{"values": [1, 2, 3, 4.5]}]})
 
 
+def test_behavior_score_is_neutral_without_parenthesized_action() -> None:
+    parsed = parse_completion_reward_response(
+        {"scores": [{"values": [5, 5, 5, 5]}, {"values": [5, 5, 5, 5]}]},
+        expected_count=2,
+    )
+    assert completion_response_rewards(
+        parsed,
+        reply_texts=("plain dialogue", "(takes a step) dialogue"),
+    ) == (4.5, 5.0)
+    assert completion_response_rewards(
+        parsed,
+        reply_texts=("（点头）对白", "() empty action"),
+    ) == (5.0, 4.5)
+
+
 def test_trajectory_response_requires_exact_task_coverage() -> None:
     tasks = ["shared", "private"]
     parsed = parse_trajectory_reward_response(
@@ -240,7 +256,7 @@ async def test_deepseek_transport_parses_raw_response_and_orders_batch() -> None
     assert [item.completion_id for item in rewards] == [
         item.completion_id for sample in (first, second) for item in sample.completions
     ]
-    assert [item.reward for item in rewards] == [1.0, 2.0, 3.0, 4.0]
+    assert [item.reward for item in rewards] == [1.5, 2.25, 3.0, 3.75]
     assert transport.max_active == 1
     assert all("secret-key" not in json.dumps(call["payload"]) for call in transport.calls)
     assert all(item.raw_response for item in rewards)
@@ -312,7 +328,7 @@ async def test_deepseek_http_retry_and_scope_specific_payload_messages() -> None
     )
     local = await provider.score_completion(source, sample, sample.completions[0])
     trajectory_role_reward = await provider.score_trajectory(source, sample, "Alice")
-    assert local.status is RewardStatus.VALID and local.reward == 4.0
+    assert local.status is RewardStatus.VALID and local.reward == 3.75
     assert trajectory_role_reward.status is RewardStatus.VALID
     assert trajectory_role_reward.reward == 4.0
     local_body = json.loads(transport.calls[1]["payload"]["messages"][1]["content"])
@@ -321,10 +337,12 @@ async def test_deepseek_http_retry_and_scope_specific_payload_messages() -> None
     assert set(trajectory_body) == {"history"}
     assert "角色=Alice" in transport.calls[1]["payload"]["messages"][0]["content"]
     assert "alice-secret" in transport.calls[2]["payload"]["messages"][0]["content"]
-    assert transport.calls[1]["payload"]["temperature"] == 0.2
-    assert transport.calls[2]["payload"]["temperature"] == 0.2
-    assert transport.calls[1]["payload"]["max_tokens"] == 15000
-    assert transport.calls[2]["payload"]["max_tokens"] == 15000
+    assert transport.calls[1]["payload"]["temperature"] == 1.0
+    assert transport.calls[2]["payload"]["temperature"] == 1.0
+    assert transport.calls[1]["payload"]["reasoning_effort"] == "high"
+    assert transport.calls[2]["payload"]["reasoning_effort"] == "high"
+    assert transport.calls[1]["payload"]["max_tokens"] == 25000
+    assert transport.calls[2]["payload"]["max_tokens"] == 25000
 
 
 @pytest.mark.asyncio
@@ -374,7 +392,7 @@ async def test_completion_role_request_maps_multiple_replies_in_stable_order() -
         base.completions[0].completion_id,
         third.completion_id,
     ]
-    assert [reward.reward for reward in rewards] == [2.5, 3.5]
+    assert [reward.reward for reward in rewards] == [2.25, 3.75]
     assert len(transport.calls) == 1
 
 

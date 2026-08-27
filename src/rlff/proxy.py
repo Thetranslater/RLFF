@@ -321,9 +321,11 @@ class RLFFGroupAwareAgent:
         trajectory_reward_retries: int | None = None,
         completion_reward_concurrency: int = 4,
         trajectory_reward_concurrency: int | None = None,
-        completion_reward_temperature: float = 0.2,
+        completion_reward_temperature: float = 1.0,
         trajectory_reward_temperature: float | None = None,
-        completion_reward_max_tokens: int = 15000,
+        completion_reward_reasoning_effort: str = "high",
+        trajectory_reward_reasoning_effort: str | None = None,
+        completion_reward_max_tokens: int = 25000,
         trajectory_reward_max_tokens: int | None = None,
         langsmith_tracing: bool = False,
         langsmith_project: str = "rlff",
@@ -364,6 +366,8 @@ class RLFFGroupAwareAgent:
         self._trajectory_reward_concurrency = trajectory_reward_concurrency
         self._completion_reward_temperature = completion_reward_temperature
         self._trajectory_reward_temperature = trajectory_reward_temperature
+        self._completion_reward_reasoning_effort = completion_reward_reasoning_effort
+        self._trajectory_reward_reasoning_effort = trajectory_reward_reasoning_effort
         self._completion_reward_max_tokens = completion_reward_max_tokens
         self._trajectory_reward_max_tokens = trajectory_reward_max_tokens
         self._langsmith_tracing = langsmith_tracing
@@ -634,6 +638,8 @@ class RLFFGroupAwareAgent:
                 trajectory_concurrency=self._trajectory_reward_concurrency,
                 completion_temperature=self._completion_reward_temperature,
                 trajectory_temperature=self._trajectory_reward_temperature,
+                completion_reasoning_effort=self._completion_reward_reasoning_effort,
+                trajectory_reasoning_effort=self._trajectory_reward_reasoning_effort,
                 completion_max_tokens=self._completion_reward_max_tokens,
                 trajectory_max_tokens=self._trajectory_reward_max_tokens,
                 langsmith_project=self._langsmith_project,

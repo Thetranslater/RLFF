@@ -58,10 +58,12 @@ def test_config_hierarchy_defaults_and_non_secret_snapshot(
     assert config.rollout.max_rounds == 3
     assert config.rewards.completion.model == "deepseek-v4-flash"
     assert config.rewards.global_reward.model == "deepseek-v4-flash"
-    assert config.rewards.completion.temperature == 0.2
-    assert config.rewards.global_reward.temperature == 0.2
-    assert config.rewards.completion.max_tokens == 15000
-    assert config.rewards.global_reward.max_tokens == 15000
+    assert config.rewards.completion.temperature == 1.0
+    assert config.rewards.global_reward.temperature == 1.0
+    assert config.rewards.completion.reasoning_effort == "high"
+    assert config.rewards.global_reward.reasoning_effort == "high"
+    assert config.rewards.completion.max_tokens == 25000
+    assert config.rewards.global_reward.max_tokens == 25000
     assert config.lora.dtype == "bfloat16"
     assert config.areal.use_bf16 is True
     assert config.grpo.normalize_by_role is True

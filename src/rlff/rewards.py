@@ -64,6 +64,9 @@ COMPLETION_DIMENSIONS: Final = (
     "行为",
 )
 _PROMPT_VARIABLE_PATTERN: Final = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_ACTION_MARKUP_PATTERN: Final = re.compile(r"\([^()]+\)|（[^（）]+）")
+_ACTION_DIMENSION_INDEX: Final = 3
+_NO_ACTION_SCORE: Final = 3
 
 
 class RewardError(ValueError):
@@ -343,10 +346,35 @@ def completion_response_reward(parsed: CompletionRewardResponse) -> float:
     return rewards[0]
 
 
-def completion_response_rewards(parsed: CompletionRewardResponse) -> tuple[float, ...]:
-    """Average the four fixed dimensions independently for each reply."""
+def completion_effective_values(score: CompletionScore, reply_text: str) -> tuple[int, ...]:
+    """Neutralize behavior when the corresponding reply has no action markup."""
 
-    return tuple(sum(item.values) / len(item.values) for item in parsed.scores)
+    values = list(score.values)
+    if not _ACTION_MARKUP_PATTERN.search(reply_text):
+        values[_ACTION_DIMENSION_INDEX] = _NO_ACTION_SCORE
+    return tuple(values)
+
+
+def completion_response_rewards(
+    parsed: CompletionRewardResponse,
+    *,
+    reply_texts: Sequence[str] | None = None,
+) -> tuple[float, ...]:
+    """Average effective dimensions independently for each ordered reply."""
+
+    if reply_texts is None:
+        values = tuple(item.values for item in parsed.scores)
+    else:
+        texts = tuple(reply_texts)
+        if len(texts) != len(parsed.scores):
+            raise RewardResponseError(
+                "completion reply texts must exactly cover parsed completion scores"
+            )
+        values = tuple(
+            completion_effective_values(score, text)
+            for score, text in zip(parsed.scores, texts, strict=True)
+        )
+    return tuple(sum(item) / len(item) for item in values)
 
 
 def trajectory_response_reward(parsed: TrajectoryRewardResponse) -> float:
@@ -515,6 +543,7 @@ def build_completion_reward_payload(
             "profile": target.profile,
             "plot": episode.plot,
         },
+        "completion_texts": [completion.text for completion in completions],
         "input": {
             "history": _history_text(_full_trajectory_history(episode, trajectory)),
         },
@@ -666,6 +695,9 @@ def build_proxy_completion_reward_payload(
             "profile": str(target.get("profile", "")),
             "plot": str(_proxy_episode_value(episode, "plot", "")),
         },
+        "completion_texts": [
+            str(_proxy_field(item, "text", "")) for item in target_completions
+        ],
         "input": {
             "history": _history_text(history),
         },
@@ -1128,9 +1160,11 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         trajectory_retries: int | None = None,
         completion_concurrency: int = 4,
         trajectory_concurrency: int | None = None,
-        completion_temperature: float = 0.2,
+        completion_temperature: float = 1.0,
         trajectory_temperature: float | None = None,
-        completion_max_tokens: int = 15000,
+        completion_reasoning_effort: str = "high",
+        trajectory_reasoning_effort: str | None = None,
+        completion_max_tokens: int = 25000,
         trajectory_max_tokens: int | None = None,
         transport: RewardTransportCallable | RewardTransport | None = None,
         tracer: Any = None,
@@ -1166,6 +1200,8 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             trajectory_concurrency = int(trajectory_scope.concurrency)
             completion_temperature = float(completion_scope.temperature)
             trajectory_temperature = float(trajectory_scope.temperature)
+            completion_reasoning_effort = str(completion_scope.reasoning_effort)
+            trajectory_reasoning_effort = str(trajectory_scope.reasoning_effort)
             completion_max_tokens = int(completion_scope.max_tokens)
             trajectory_max_tokens = int(trajectory_scope.max_tokens)
             model = str(completion_scope.model)
@@ -1236,6 +1272,12 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             trajectory_max_tokens is not None and trajectory_max_tokens <= 0
         ):
             raise ValueError("reward max_tokens must be positive")
+        supported_reasoning_efforts = {"low", "medium", "high", "max"}
+        if completion_reasoning_effort not in supported_reasoning_efforts or (
+            trajectory_reasoning_effort is not None
+            and trajectory_reasoning_effort not in supported_reasoning_efforts
+        ):
+            raise ValueError("reward reasoning_effort must be low, medium, high, or max")
 
         self._api_key = api_key or ""
         root = base_url.rstrip("/")
@@ -1256,6 +1298,12 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             trajectory_temperature
             if trajectory_temperature is not None
             else completion_temperature
+        )
+        self._completion_reasoning_effort = completion_reasoning_effort
+        self._trajectory_reasoning_effort = (
+            trajectory_reasoning_effort
+            if trajectory_reasoning_effort is not None
+            else completion_reasoning_effort
         )
         self._completion_max_tokens = int(completion_max_tokens)
         self._trajectory_max_tokens = int(
@@ -1347,7 +1395,15 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                 for completion in completions
             )
         completion_parsed = cast(CompletionRewardResponse, parsed)
-        scalar_rewards = completion_response_rewards(completion_parsed)
+        effective_values = tuple(
+            completion_effective_values(score, completion.text)
+            for completion, score in zip(
+                completions,
+                completion_parsed.scores,
+                strict=True,
+            )
+        )
+        scalar_rewards = tuple(sum(values) / len(values) for values in effective_values)
         return tuple(
             CompletionReward(
                 completion_id=completion.completion_id,
@@ -1359,16 +1415,16 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                     RewardDimension(name=name, value=float(value))
                     for name, value in zip(
                         COMPLETION_DIMENSIONS,
-                        score.values,
+                        values,
                         strict=True,
                     )
                 ),
                 provider=self.provider_name,
                 raw_response=raw,
             )
-            for completion, score, scalar in zip(
+            for completion, values, scalar in zip(
                 completions,
-                completion_parsed.scores,
+                effective_values,
                 scalar_rewards,
                 strict=True,
             )
@@ -1450,6 +1506,16 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         completion_ids = tuple(str(value) for value in completion_ids_value)
         if not completion_ids or len(set(completion_ids)) != len(completion_ids):
             raise RewardResponseError("proxy completion_ids must be non-empty and unique")
+        completion_texts_value = payload.get("completion_texts")
+        if not isinstance(completion_texts_value, Sequence) or isinstance(
+            completion_texts_value, (str, bytes)
+        ):
+            raise RewardResponseError("proxy completion_texts must be a sequence")
+        completion_texts = tuple(str(value) for value in completion_texts_value)
+        if len(completion_texts) != len(completion_ids):
+            raise RewardResponseError(
+                "proxy completion_texts must exactly cover completion_ids"
+            )
         _raw, parsed, error = await self._request_reward(
             scope="completion_local",
             prompt=self._completion_prompt,
@@ -1462,7 +1528,10 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         )
         if parsed is None:
             raise RewardResponseError(error or "proxy completion reward response was invalid")
-        rewards = completion_response_rewards(cast(CompletionRewardResponse, parsed))
+        rewards = completion_response_rewards(
+            cast(CompletionRewardResponse, parsed),
+            reply_texts=completion_texts,
+        )
         return dict(zip(completion_ids, rewards, strict=True))
 
     async def score_proxy_trajectory_role(self, payload: Mapping[str, Any]) -> float:
@@ -1581,6 +1650,11 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                 if scope == "completion_local"
                 else self._trajectory_temperature
             ),
+            "reasoning_effort": (
+                self._completion_reasoning_effort
+                if scope == "completion_local"
+                else self._trajectory_reasoning_effort
+            ),
             "max_tokens": int(
                 self._completion_max_tokens
                 if scope == "completion_local"
@@ -1633,7 +1707,17 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                             parsed: CompletionRewardResponse | TrajectoryRewardResponse = (
                                 completion_parsed
                             )
-                            reply_rewards = completion_response_rewards(completion_parsed)
+                            completion_texts_value = payload.get("completion_texts")
+                            reply_texts = (
+                                tuple(str(value) for value in completion_texts_value)
+                                if isinstance(completion_texts_value, Sequence)
+                                and not isinstance(completion_texts_value, (str, bytes))
+                                else None
+                            )
+                            reply_rewards = completion_response_rewards(
+                                completion_parsed,
+                                reply_texts=reply_texts,
+                            )
                             scalar_reward = sum(reply_rewards) / len(reply_rewards)
                         else:
                             parsed = parse_trajectory_reward_response(
@@ -1936,6 +2020,7 @@ __all__ = [
     "build_proxy_completion_reward_payload",
     "build_proxy_trajectory_reward_payload",
     "build_trajectory_reward_payload",
+    "completion_effective_values",
     "create_reward_provider",
     "load_reward_prompt",
     "load_reward_prompts",

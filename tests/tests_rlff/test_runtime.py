@@ -133,10 +133,12 @@ def test_agent_workflow_kwargs_include_reward_sampling_settings(tmp_path: Path) 
 
     kwargs = runtime.build_agent_workflow_kwargs(config)
 
-    assert kwargs["completion_reward_temperature"] == 0.2
-    assert kwargs["trajectory_reward_temperature"] == 0.2
-    assert kwargs["completion_reward_max_tokens"] == 15000
-    assert kwargs["trajectory_reward_max_tokens"] == 15000
+    assert kwargs["completion_reward_temperature"] == 1.0
+    assert kwargs["trajectory_reward_temperature"] == 1.0
+    assert kwargs["completion_reward_reasoning_effort"] == "high"
+    assert kwargs["trajectory_reward_reasoning_effort"] == "high"
+    assert kwargs["completion_reward_max_tokens"] == 25000
+    assert kwargs["trajectory_reward_max_tokens"] == 25000
 
 
 def test_runtime_plan_rejects_nondefault_proxy_lora_name(

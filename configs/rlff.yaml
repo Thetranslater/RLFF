@@ -31,16 +31,18 @@ rewards:
     timeout_seconds: 120.0
     retries: 2
     concurrency: 4
-    temperature: 0.2
-    max_tokens: 15000
+    temperature: 1.0
+    reasoning_effort: high
+    max_tokens: 25000
   global_reward:
     model: deepseek-v4-flash
     prompt_path: prompts/trajectory_reward_system.txt
     timeout_seconds: 120.0
     retries: 2
     concurrency: 4
-    temperature: 0.2
-    max_tokens: 15000
+    temperature: 1.0
+    reasoning_effort: high
+    max_tokens: 25000
   completion_weight: 0.6
   global_weight: 0.4
   provider: deepseek
