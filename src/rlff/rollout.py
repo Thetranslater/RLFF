@@ -393,6 +393,24 @@ def _config_value(config: object | None, path: tuple[str, ...]) -> object | None
     return value
 
 
+def rounds_for_character_count(character_count: int) -> int:
+    """Return the production round-robin horizon for a character count.
+
+    One and two-character episodes use seven rounds, three-character episodes
+    use six, and episodes with four or more characters use five.  This keeps
+    the total dialogue depth comparable while ensuring every character gets
+    the same number of turns.
+    """
+
+    if type(character_count) is not int or character_count <= 0:
+        raise RolloutConfigurationError("character_count must be a positive integer")
+    if character_count <= 2:
+        return 7
+    if character_count == 3:
+        return 6
+    return 5
+
+
 def _resolve_setting(
     explicit: object | None,
     config: object | None,
@@ -768,12 +786,12 @@ async def rollout_group(
     if tokenizer is None:
         raise RolloutConfigurationError("a configured prompt tokenizer is required")
     samples = _validate_group_inputs(group)
-    resolved_max_rounds = _resolve_setting(max_rounds, config, ("rollout", "max_rounds"), 1)
+    resolved_max_rounds = _resolve_setting(max_rounds, config, ("rollout", "max_rounds"), 7)
     resolved_context = _resolve_setting(context_length, config, ("sglang", "context_length"), 8192)
-    resolved_max_new = _resolve_setting(max_new_tokens, config, ("sglang", "max_new_tokens"), 512)
+    resolved_max_new = _resolve_setting(max_new_tokens, config, ("sglang", "max_new_tokens"), 256)
     resolved_temperature = _resolve_setting(temperature, config, ("sglang", "temperature"), 0.9)
     resolved_top_p = _resolve_setting(top_p, config, ("sglang", "top_p"), 1.0)
-    rounds_value = _positive_int_setting(resolved_max_rounds, field_name="max_rounds")
+    rounds_cap = _positive_int_setting(resolved_max_rounds, field_name="max_rounds")
     context_value = _positive_int_setting(resolved_context, field_name="context_length")
     max_new_value = _positive_int_setting(resolved_max_new, field_name="max_new_tokens")
     temperature_value = _numeric_setting(resolved_temperature, field_name="temperature")
@@ -795,6 +813,7 @@ async def rollout_group(
         aliases=("tokenizer_fingerprint", "fingerprint"),
     )
     characters = tuple(character.name for character in group.episode.characters)
+    rounds_value = min(rounds_cap, rounds_for_character_count(len(characters)))
     trajectories = tuple(
         await asyncio.gather(
             *(
@@ -840,5 +859,6 @@ __all__ = [
     "TokenizedPrompt",
     "huggingface_tokenizer_fingerprint",
     "rollout_group",
+    "rounds_for_character_count",
     "validate_rollout_group",
 ]

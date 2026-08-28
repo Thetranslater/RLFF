@@ -21,7 +21,7 @@ scheduler:
 gconfig:
   n_samples: 4
   min_new_tokens: 0
-  max_new_tokens: 512
+  max_new_tokens: 256
   greedy: false
   temperature: 1.0
   top_p: 0.9
@@ -66,7 +66,7 @@ actor:
   ppo_n_minibatches: 1
   recompute_logprob: false
   use_decoupled_loss: false
-  max_new_tokens: 512
+  max_new_tokens: 256
   weight_update_mode: disk
   use_lora: true
   peft_type: lora
@@ -121,7 +121,7 @@ sglang:
   attention_backend: triton
   sampling_backend: pytorch
   max_running_requests: null
-  context_length: 5120
+  context_length: 6144
   # Leave enough headroom for the colocated FSDP actor during onload/update.
   mem_fraction_static: 0.6
   enable_lora: true
@@ -135,7 +135,7 @@ train_dataset:
   num_workers: 0
   path: data/episodes.jsonl
   type: rl
-  max_length: 5120
+  max_length: 6144
 
 valid_dataset: null
 

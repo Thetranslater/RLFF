@@ -15,9 +15,11 @@ documents. Do not silently broaden the scope or substitute another framework.
 - An episode contains an ordered, non-empty `characters` list. Generation is
   direct round-robin in that order. There is intentionally no scheduler
   abstraction in the first implementation.
-- `max_rounds` means complete round-robin cycles, so every character receives
-  the same number of completions. Natural conversation termination is outside
-  scope. EOS ends only the current completion.
+- `max_rounds` is an upper bound on complete round-robin cycles. The production
+  horizon is derived from character count: 7 rounds for one or two characters,
+  6 for three characters, and 5 for four or more characters. Every character
+  therefore receives the same number of completions. Natural conversation
+  termination is outside scope. EOS ends only the current completion.
 - Generated trajectories contain character messages only. There is no
   Environment/narrator role, reward, completion, or loss mask.
 - Every generation uses the target character's system prompt, profile, plot,
@@ -33,7 +35,7 @@ documents. Do not silently broaden the scope or substitute another framework.
 - First-version rewards contain only completion-local character rewards and a
   trajectory-global reward. The old initialization/instant state verifier is
   not part of the new training path.
-- Both reward scopes ultimately call DeepSeek v4 flash over HTTP. Until reward
+- Both reward scopes ultimately call Qwen3.7-Flash through native DashScope HTTP. Until reward
   prompts/schemas are finalized, an explicitly enabled zero-reward provider
   keeps the pipeline runnable.
 - Invalid RM output is never silently converted to a zero reward. After bounded
@@ -54,7 +56,7 @@ Owns `contracts.py`, `config.py`, and `episodes.py` plus their tests.
 
 Deliver a strict, versioned protocol; JSONL loading; deterministic IDs and
 fingerprints; validation; group sampling; target-character prompt projection;
-and configuration validation. This phase does not call SGLang, DeepSeek, or
+and configuration validation. This phase does not call SGLang, DashScope, or
 AReaL.
 
 ### Phase B — multi-character rollout
@@ -66,12 +68,12 @@ request/response conversion, exact token/logprob capture, fixed policy-version
 checks, context-limit handling, and trajectory assembly. Do not add a scheduler
 interface, tool calls, external environment, narrator, or natural-stop model.
 
-### Phase C — DeepSeek reward pipeline
+### Phase C — DashScope reward pipeline
 
 Owns `rewards.py`, `prompts/`, and their tests.
 
 Deliver strict local/global response schemas, placeholder zero rewards,
-DeepSeek HTTP calls, bounded retry/concurrency, LangSmith tracing, raw response
+native DashScope HTTP calls, bounded retry/concurrency, LangSmith tracing, raw response
 audit records, scalar aggregation, and invalid-result propagation. Do not add
 state validation or LangChain/LangGraph.
 

@@ -12,6 +12,7 @@ from rlff.config import (
     RewardConfig,
     RLFFConfig,
     RolloutConfig,
+    SGLangConfig,
     load_config,
 )
 
@@ -56,25 +57,29 @@ def test_config_hierarchy_defaults_and_non_secret_snapshot(
 
     assert config.episode.group_size == 4
     assert config.rollout.max_rounds == 3
-    assert config.rewards.completion.model == "deepseek-v4-flash"
-    assert config.rewards.global_reward.model == "deepseek-v4-flash"
-    assert config.rewards.completion.temperature == 1.0
-    assert config.rewards.global_reward.temperature == 1.0
-    assert config.rewards.completion.reasoning_effort == "low"
-    assert config.rewards.global_reward.reasoning_effort == "low"
-    assert config.rewards.completion.max_tokens == 25000
-    assert config.rewards.global_reward.max_tokens == 25000
+    assert config.rewards.completion.model == "qwen3.7-flash"
+    assert config.rewards.global_reward.model == "qwen3.7-flash"
+    assert config.rewards.completion.temperature == 0.7
+    assert config.rewards.global_reward.temperature == 0.7
+    assert config.rewards.completion.reasoning_effort == "medium"
+    assert config.rewards.global_reward.reasoning_effort == "medium"
+    assert config.rewards.completion.max_tokens == 16384
+    assert config.rewards.global_reward.max_tokens == 16384
     assert config.lora.dtype == "bfloat16"
     assert config.areal.use_bf16 is True
     assert config.grpo.normalize_by_role is True
     assert config.grpo.drop_incomplete_trajectory is True
 
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "do-not-serialize")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "do-not-serialize")
     secrets = config.resolve_runtime_secrets()
-    assert secrets.deepseek_api_key == "do-not-serialize"
+    assert secrets.reward_api_key == "do-not-serialize"
     snapshot = json.dumps(config.resolved_snapshot(), ensure_ascii=False)
     assert "do-not-serialize" not in snapshot
     assert config.rewards.api_key_env in snapshot
+
+
+def test_default_rollout_output_limit_is_256_tokens() -> None:
+    assert SGLangConfig(model="local-model").max_new_tokens == 256
 
 
 def test_yaml_and_json_loaders_accept_utf8_sig(tmp_path: Path) -> None:
@@ -171,9 +176,9 @@ def test_unsafe_numeric_and_adapter_combinations_are_rejected(tmp_path: Path) ->
 
 def test_missing_reward_secret_is_explicit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     payload = config_payload(tmp_path)
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     config = RLFFConfig.model_validate(payload)
-    with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
+    with pytest.raises(RuntimeError, match="DASHSCOPE_API_KEY"):
         config.resolve_runtime_secrets()
 
 
@@ -183,7 +188,7 @@ def test_langsmith_tracing_requires_its_env_secret(
 ) -> None:
     payload = config_payload(tmp_path)
     payload["observability"] = {"langsmith_tracing": True}
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "reward-key")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "reward-key")
     monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
     config = RLFFConfig.model_validate(payload)
     with pytest.raises(RuntimeError, match="LANGSMITH_API_KEY"):

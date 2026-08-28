@@ -9,9 +9,12 @@ from rlff.proxy import (
     RLFFGroupAwareAgent,
 )
 from rlff.rollout_audit import (
+    DEFAULT_EPISODE_COUNT,
+    DEFAULT_EPISODE_SEED,
     DeterministicAuditRewardProvider,
     _as_rows,
     audit_rollout_batches,
+    select_episode_indices,
 )
 from rlff.runtime import role_advantage_tensor_data
 
@@ -39,6 +42,66 @@ class FakeRTensor:
 
     def to_local(self) -> object:
         return self.data
+
+
+def test_select_episode_indices_defaults_to_twenty_unique_deterministic_episodes() -> None:
+    dataset = list(range(25))
+
+    selected = select_episode_indices(dataset)
+
+    assert DEFAULT_EPISODE_COUNT == 20
+    assert DEFAULT_EPISODE_SEED == 42
+    assert len(selected) == 20
+    assert len(set(selected)) == 20
+    assert selected == select_episode_indices(dataset, count=20, seed=42)
+
+
+def test_select_episode_indices_rejects_count_larger_than_dataset() -> None:
+    with pytest.raises(ValueError, match="cannot sample 20 episodes"):
+        select_episode_indices([1, 2, 3])
+
+
+def test_audit_batch_mode_skips_episode_structure_mapping() -> None:
+    torch = pytest.importorskip("torch")
+    raw = {
+        "input_ids": torch.tensor(
+            [[10, 20, 21, 0], [11, 22, 0, 0], [12, 23, 24, 0], [13, 25, 0, 0]]
+        ),
+        "attention_mask": torch.tensor(
+            [[1, 1, 1, 0], [1, 1, 0, 0], [1, 1, 1, 0], [1, 1, 0, 0]]
+        ),
+        "loss_mask": torch.tensor(
+            [[0, 1, 1, 0], [0, 1, 0, 0], [0, 1, 1, 0], [0, 1, 0, 0]]
+        ),
+        "logprobs": torch.tensor(
+            [[0.0, -0.1, -0.2, 0.0], [0.0, -0.3, 0.0, 0.0],
+             [0.0, -0.4, -0.5, 0.0], [0.0, -0.6, 0.0, 0.0]]
+        ),
+        "versions": torch.tensor(
+            [[-1, 0, 0, -1], [-1, 0, -1, -1], [-1, 1, 1, -1], [-1, 1, -1, -1]]
+        ),
+        "rewards": torch.tensor([-1.0, -1.0, 1.0, 1.0]),
+    }
+    training = role_advantage_tensor_data(
+        {key: value.detach().clone() for key, value in raw.items()}
+    )
+
+    records, summary = audit_rollout_batches(
+        [raw],
+        [training],
+        tokenizer=FakeTokenizer(),
+        characters=(),
+        group_size=2,
+        max_rounds=1,
+        context_length=16,
+        max_new_tokens=4,
+        validate_episode_structure=False,
+    )
+
+    assert summary["status"] == "passed"
+    assert summary["expected_interactions"] == 4
+    assert summary["characters"] == []
+    assert all(record["character"] is None for record in records)
 
 
 def test_as_rows_localizes_areal_remote_tensor_handles() -> None:

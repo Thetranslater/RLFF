@@ -48,7 +48,7 @@ def _config(tmp_path: Path) -> RLFFConfig:
                 "base_seed": 7,
             },
             "prompt": {"template_paths": [], "template_ids": []},
-            "rollout": {"max_rounds": 2},
+            "rollout": {"max_rounds": 7},
             "sglang": {
                 "model": "models/base/Qwen2.5-7B-Instruct",
                 "base_url": "http://127.0.0.1:30000",
@@ -202,8 +202,18 @@ async def test_real_agent_openai_transport_accumulates_round_robin_history(
         "Bob",
         "Alice",
         "Bob",
+        "Alice",
+        "Bob",
+        "Alice",
+        "Bob",
+        "Alice",
+        "Bob",
+        "Alice",
+        "Bob",
+        "Alice",
+        "Bob",
     ]
-    assert len(requests) == 4
+    assert len(requests) == 14
     assert all(request["model"] == "base:rlff-sft" for request in requests)
     assert any(
         message["role"] == "user" and "Alice:reply-Alice-0" in message["content"]

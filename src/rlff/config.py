@@ -37,7 +37,7 @@ _POSITIVE_INT = Annotated[StrictInt, Field(gt=0)]
 _NON_NEGATIVE_INT = Annotated[StrictInt, Field(ge=0)]
 _PROBABILITY = Annotated[StrictFloat, Field(ge=0, le=1)]
 
-DEFAULT_REWARD_MODEL: Final = "deepseek-v4-flash"
+DEFAULT_REWARD_MODEL: Final = "qwen3.7-flash"
 DEFAULT_SGLANG_MODEL: Final = ""
 AREAL_VERSION: Final = "1.0.4"
 AREAL_COMMIT: Final = "37d6c6400e99a05fa3409d6a067762a44df40d3b"
@@ -115,7 +115,9 @@ class PromptTemplateConfig(ConfigModel):
 class RolloutConfig(ConfigModel):
     """Direct ordered round-robin rollout settings."""
 
-    max_rounds: _POSITIVE_INT = 1
+    # This is the configurable upper bound.  The actual horizon is derived
+    # from the episode character count and is therefore 5, 6, or 7.
+    max_rounds: _POSITIVE_INT = 7
 
 
 class SGLangConfig(ConfigModel):
@@ -125,7 +127,8 @@ class SGLangConfig(ConfigModel):
     base_url: _NON_EMPTY = "http://127.0.0.1:30000"
     temperature: StrictFloat = 0.9
     top_p: StrictFloat = 1.0
-    max_new_tokens: _POSITIVE_INT = 512
+    frequency_penalty: StrictFloat = 0.0
+    max_new_tokens: _POSITIVE_INT = 256
     context_length: _POSITIVE_INT = 8192
     timeout_seconds: StrictFloat = 120.0
     api_key_env: _NON_EMPTY | None = None
@@ -151,6 +154,13 @@ class SGLangConfig(ConfigModel):
             raise ValueError("top_p must be no greater than 1")
         return value
 
+    @field_validator("frequency_penalty")
+    @classmethod
+    def frequency_penalty_is_supported(cls, value: float) -> float:
+        if not -2 <= value <= 2:
+            raise ValueError("frequency_penalty must be between -2 and 2")
+        return value
+
     @model_validator(mode="after")
     def context_can_fit_completion(self) -> SGLangConfig:
         if self.context_length <= self.max_new_tokens:
@@ -159,16 +169,16 @@ class SGLangConfig(ConfigModel):
 
 
 class RewardScopeConfig(ConfigModel):
-    """One DeepSeek reward scope: completion-local or trajectory-role."""
+    """One reward-model scope: completion-local or trajectory-role."""
 
     model: _NON_EMPTY = DEFAULT_REWARD_MODEL
     prompt_path: Path
     timeout_seconds: StrictFloat = 120.0
     retries: _NON_NEGATIVE_INT = 2
     concurrency: _POSITIVE_INT = 4
-    temperature: StrictFloat = 1.0
-    reasoning_effort: Literal["low", "medium", "high", "max"] = "low"
-    max_tokens: _POSITIVE_INT = 25000
+    temperature: StrictFloat = 0.7
+    reasoning_effort: Literal["low", "medium", "high", "max"] = "medium"
+    max_tokens: _POSITIVE_INT = 16384
 
     @field_validator("timeout_seconds")
     @classmethod
@@ -186,7 +196,7 @@ class RewardScopeConfig(ConfigModel):
 
 
 class RewardConfig(ConfigModel):
-    """DeepSeek completion/role-task settings and explicit placeholder opt-in.
+    """Completion/role-task provider settings and explicit placeholder opt-in.
 
     ``global_reward`` remains the configuration key for backward compatibility;
     its value is evaluated independently for every target character.
@@ -198,13 +208,16 @@ class RewardConfig(ConfigModel):
     )
     completion_weight: StrictFloat = 0.6
     global_weight: StrictFloat = 0.4
-    provider: Literal["deepseek", "placeholder"] = "deepseek"
+    provider: Literal["qwen_dashscope", "deepseek", "placeholder"] = "qwen_dashscope"
     allow_placeholder: StrictBool = Field(
         default=False,
         validation_alias=AliasChoices("allow_placeholder", "allow_placeholder_reward"),
     )
-    api_key_env: _NON_EMPTY = "DEEPSEEK_API_KEY"
-    base_url: _NON_EMPTY = "https://api.deepseek.com"
+    api_key_env: _NON_EMPTY = "DASHSCOPE_API_KEY"
+    base_url: _NON_EMPTY = (
+        "https://dashscope.aliyuncs.com/api/v1/services/aigc/"
+        "multimodal-generation/generation"
+    )
     schema_version: Literal["rlff.reward.v1"] = REWARD_SCHEMA_VERSION
 
     @field_validator("completion_weight", "global_weight")
@@ -301,7 +314,7 @@ class AReaLConfig(ConfigModel):
     proxy_mode: Literal["inline"] = "inline"
     proxy_turn_discount: StrictFloat = 0.0
     proxy_export_style: Literal["individual"] = "individual"
-    proxy_group_timeout_seconds: StrictFloat = 3600.0
+    proxy_group_timeout_seconds: StrictFloat = 600.0
     # The default is intentionally absent: cloud launch must provide an agent
     # implementation (or a workflow path) rather than inventing a narrator or
     # environment actor.
@@ -377,13 +390,19 @@ class ObservabilityConfig(ConfigModel):
 class RuntimeSecrets:
     """Process-local secret values; this type is never part of config dumps."""
 
-    deepseek_api_key: str | None
+    reward_api_key: str | None
     langsmith_api_key: str | None
     sglang_api_key: str | None
 
+    @property
+    def deepseek_api_key(self) -> str | None:
+        """Backward-compatible alias for older reward-model test tooling."""
+
+        return self.reward_api_key
+
     def redacted(self) -> dict[str, bool]:
         return {
-            "deepseek_api_key": self.deepseek_api_key is not None,
+            "reward_api_key": self.reward_api_key is not None,
             "langsmith_api_key": self.langsmith_api_key is not None,
             "sglang_api_key": self.sglang_api_key is not None,
         }
@@ -452,12 +471,12 @@ class RLFFConfig(ConfigModel):
         """Resolve env-referenced credentials without adding them to config state."""
 
         require_reward = (
-            self.rewards.provider == "deepseek"
+            self.rewards.provider != "placeholder"
             if require_reward_key is None
             else require_reward_key
         )
-        deepseek_key = os.getenv(self.rewards.api_key_env)
-        if require_reward and not deepseek_key:
+        reward_key = os.getenv(self.rewards.api_key_env)
+        if require_reward and not reward_key:
             raise RuntimeError(
                 f"reward provider requires environment variable {self.rewards.api_key_env}"
             )
@@ -470,7 +489,7 @@ class RLFFConfig(ConfigModel):
         sglang_key = (
             os.getenv(self.sglang.api_key_env) if self.sglang.api_key_env is not None else None
         )
-        return RuntimeSecrets(deepseek_key, langsmith_key, sglang_key)
+        return RuntimeSecrets(reward_key, langsmith_key, sglang_key)
 
 
 def load_config(path: str | Path) -> RLFFConfig:

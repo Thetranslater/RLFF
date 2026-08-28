@@ -4,7 +4,7 @@ The reward boundary is deliberately small.  A provider scores all replies by
 one character in a trajectory or scores that character's trajectory tasks,
 while the helpers in this module preserve rollout order
 and aggregate the resulting frozen :mod:`rlff.contracts` records.  The
-DeepSeek implementation uses a reward-local HTTP transport because the shared
+The production implementations use a reward-local HTTP transport because the shared
 ``src/LLM`` client intentionally exposes decoded JSON rather than raw HTTP
 responses; tests can inject the same narrow transport without making network
 requests.
@@ -50,10 +50,16 @@ from .contracts import (
 REWARD_PROMPT_VERSION: Final = "rlff.reward.prompts.v2"
 REWARD_REQUEST_SCHEMA_VERSION: Final = "rlff.reward.request.v2"
 REWARD_RESPONSE_SCHEMA_VERSION: Final = "rlff.reward.response.v2"
-COMPLETION_REWARD_PROMPT_FILENAME: Final = "completion_reward_system.txt"
+COMPLETION_REWARD_PROMPT_FILENAME: Final = "completion_reward_system_v2.txt"
 TRAJECTORY_REWARD_PROMPT_FILENAME: Final = "trajectory_reward_system.txt"
 PLACEHOLDER_MARKER: Final = "[PLACEHOLDER]"
 DEEPSEEK_V4_FLASH_PROVIDER: Final = "deepseek-v4-flash"
+QWEN3_7_FLASH_PROVIDER: Final = "qwen3.7-flash"
+QWEN_DASHSCOPE_PROVIDER: Final = "qwen_dashscope"
+QWEN_DASHSCOPE_GENERATION_URL: Final = (
+    "https://dashscope.aliyuncs.com/api/v1/services/aigc/"
+    "multimodal-generation/generation"
+)
 PLACEHOLDER_PROVIDER: Final = "placeholder-null-v1"
 CHAT_COMPLETIONS_PATH: Final = "/chat/completions"
 
@@ -178,15 +184,15 @@ def _validate_prompt_text(
     text: str,
     *,
     source: str,
-    provider: Literal["deepseek", "placeholder"],
+    provider: Literal["qwen_dashscope", "deepseek", "placeholder"],
     development: bool,
 ) -> str:
     content = text.strip()
     if not content:
         raise RewardPromptError(f"reward prompt is empty: {source}")
-    if provider == "deepseek" and PLACEHOLDER_MARKER in content and not development:
+    if provider != "placeholder" and PLACEHOLDER_MARKER in content and not development:
         raise RewardPromptError(
-            "production DeepSeek reward mode refuses a [PLACEHOLDER] prompt; "
+            "production reward mode refuses a [PLACEHOLDER] prompt; "
             "use finalized prompts or an explicit development=True path"
         )
     return content
@@ -195,7 +201,7 @@ def _validate_prompt_text(
 def load_reward_prompt(
     path: str | Path,
     *,
-    provider: Literal["deepseek", "placeholder"] = "deepseek",
+    provider: Literal["qwen_dashscope", "deepseek", "placeholder"] = "qwen_dashscope",
     development: bool = False,
     allow_placeholder: bool | None = None,
 ) -> str:
@@ -220,7 +226,7 @@ def load_reward_prompts(
     completion_path: str | Path,
     trajectory_path: str | Path,
     *,
-    provider: Literal["deepseek", "placeholder"] = "deepseek",
+    provider: Literal["qwen_dashscope", "deepseek", "placeholder"] = "qwen_dashscope",
     development: bool = False,
     allow_placeholder: bool | None = None,
 ) -> RewardPrompts:
@@ -399,7 +405,7 @@ RewardTransportCallable: TypeAlias = Callable[..., Awaitable[RewardTransportResu
 
 
 class RewardTransport(Protocol):
-    """Small injectable async HTTP boundary used by DeepSeek provider."""
+    """Small injectable async HTTP boundary used by remote reward providers."""
 
     async def __call__(
         self,
@@ -545,7 +551,7 @@ def build_completion_reward_payload(
         },
         "completion_texts": [completion.text for completion in completions],
         "input": {
-            "history": _history_text(_full_trajectory_history(episode, trajectory)),
+            "utterances": _history_text(_full_trajectory_history(episode, trajectory)),
         },
     }
 
@@ -577,7 +583,7 @@ def build_trajectory_reward_payload(
         },
         "tasks": list(tasks),
         "input": {
-            "history": _history_text(full_history),
+            "utterances": _history_text(full_history),
         },
     }
 
@@ -699,7 +705,7 @@ def build_proxy_completion_reward_payload(
             str(_proxy_field(item, "text", "")) for item in target_completions
         ],
         "input": {
-            "history": _history_text(history),
+            "utterances": _history_text(history),
         },
     }
 
@@ -766,7 +772,7 @@ def build_proxy_trajectory_reward_payload(
         },
         "tasks": list(tasks),
         "input": {
-            "history": _history_text(history),
+            "utterances": _history_text(history),
         },
     }
 
@@ -1142,6 +1148,8 @@ class DeepSeekRewardProvider(_RewardProviderBase):
     """DeepSeek v4 flash HTTP reward provider with bounded retries."""
 
     provider_name = DEEPSEEK_V4_FLASH_PROVIDER
+    config_provider_name = "deepseek"
+    default_api_key_env = "DEEPSEEK_API_KEY"
 
     def __init__(
         self,
@@ -1177,19 +1185,22 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         if allow_placeholder_prompt is not None:
             development = development or allow_placeholder_prompt
         if config is not None:
-            if getattr(config, "provider", "deepseek") != "deepseek":
-                raise ValueError("DeepSeek provider requires config.provider='deepseek'")
+            if getattr(config, "provider", self.config_provider_name) != self.config_provider_name:
+                raise ValueError(
+                    f"{self.provider_name} provider requires "
+                    f"config.provider={self.config_provider_name!r}"
+                )
             completion_scope = config.completion
             trajectory_scope = config.global_reward
             base_url = str(config.base_url)
             completion_prompt = load_reward_prompt(
                 completion_scope.prompt_path,
-                provider="deepseek",
+                provider=cast(Any, self.config_provider_name),
                 development=development,
             )
             trajectory_prompt = load_reward_prompt(
                 trajectory_scope.prompt_path,
-                provider="deepseek",
+                provider=cast(Any, self.config_provider_name),
                 development=development,
             )
             completion_timeout_seconds = float(completion_scope.timeout_seconds)
@@ -1213,29 +1224,30 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             if completion_prompt is None and completion_prompt_path is not None:
                 completion_prompt = load_reward_prompt(
                     completion_prompt_path,
-                    provider="deepseek",
+                    provider=cast(Any, self.config_provider_name),
                     development=development,
                 )
             if trajectory_prompt is None and trajectory_prompt_path is not None:
                 trajectory_prompt = load_reward_prompt(
                     trajectory_prompt_path,
-                    provider="deepseek",
+                    provider=cast(Any, self.config_provider_name),
                     development=development,
                 )
         if completion_prompt is None or trajectory_prompt is None:
             raise RewardPromptError(
-                "DeepSeek provider requires non-empty completion_prompt and trajectory_prompt"
+                f"{self.provider_name} provider requires non-empty completion_prompt "
+                "and trajectory_prompt"
             )
         self._completion_prompt = _validate_prompt_text(
             completion_prompt,
             source="completion_prompt",
-            provider="deepseek",
+            provider=cast(Any, self.config_provider_name),
             development=development,
         )
         self._trajectory_prompt = _validate_prompt_text(
             trajectory_prompt,
             source="trajectory_prompt",
-            provider="deepseek",
+            provider=cast(Any, self.config_provider_name),
             development=development,
         )
         # Fail before any rollout/reward traffic if a configured prompt does
@@ -1251,9 +1263,9 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             {"character": "character", "plot": "plot", "tasks": "[]"},
             required=("character", "plot", "tasks"),
         )
-        api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        api_key = api_key or os.getenv(self.default_api_key_env)
         if transport is None and not api_key:
-            raise ValueError("DeepSeek reward provider requires an API key")
+            raise ValueError(f"{self.provider_name} reward provider requires an API key")
         if completion_timeout_seconds <= 0 or (
             trajectory_timeout_seconds is not None and trajectory_timeout_seconds <= 0
         ):
@@ -1280,8 +1292,7 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             raise ValueError("reward reasoning_effort must be low, medium, high, or max")
 
         self._api_key = api_key or ""
-        root = base_url.rstrip("/")
-        self._url = root if root.endswith(CHAT_COMPLETIONS_PATH) else root + CHAT_COMPLETIONS_PATH
+        self._url = self._normalize_url(base_url)
         self._model = model
         self._completion_timeout = float(completion_timeout_seconds)
         self._trajectory_timeout = float(
@@ -1576,6 +1587,31 @@ class DeepSeekRewardProvider(_RewardProviderBase):
     ) -> CompletionReward:
         return await self.score_completion(episode, trajectory, completion)
 
+    def _normalize_url(self, base_url: str) -> str:
+        root = base_url.rstrip("/")
+        return root if root.endswith(CHAT_COMPLETIONS_PATH) else root + CHAT_COMPLETIONS_PATH
+
+    def _build_request_payload(
+        self,
+        *,
+        model: str,
+        messages: Sequence[Mapping[str, Any]],
+        temperature: float,
+        reasoning_effort: str,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        """Build the provider-specific wire payload for one reward request."""
+
+        return {
+            "model": model,
+            "messages": list(messages),
+            "temperature": temperature,
+            "reasoning_effort": reasoning_effort,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+            "stream": False,
+        }
+
     async def _request_reward(
         self,
         *,
@@ -1642,27 +1678,25 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                 },
             ]
         )
-        request_payload: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": (
+        request_payload = self._build_request_payload(
+            model=model,
+            messages=messages,
+            temperature=(
                 self._completion_temperature
                 if scope == "completion_local"
                 else self._trajectory_temperature
             ),
-            "reasoning_effort": (
+            reasoning_effort=(
                 self._completion_reasoning_effort
                 if scope == "completion_local"
                 else self._trajectory_reasoning_effort
             ),
-            "max_tokens": int(
+            max_tokens=int(
                 self._completion_max_tokens
                 if scope == "completion_local"
                 else self._trajectory_max_tokens
             ),
-            "response_format": {"type": "json_object"},
-            "stream": False,
-        }
+        )
         headers = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
@@ -1696,7 +1730,8 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                         raw_response = _redact(response.text, [self._api_key])
                         if not 200 <= response.status_code < 300:
                             raise RewardTransportError(
-                                f"DeepSeek HTTP status {response.status_code}: {raw_response}"
+                                f"{self.provider_name} HTTP status {response.status_code}: "
+                                f"{raw_response}"
                             )
                         model_text = self._extract_model_text(raw_response)
                         if scope == "completion_local":
@@ -1757,7 +1792,7 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             raw_response,
             None,
             (
-                f"DeepSeek {scope} reward exhausted {retries + 1} attempts: "
+                f"{self.provider_name} {scope} reward exhausted {retries + 1} attempts: "
                 f"{last_error or 'unknown reward error'}"
             ),
         )
@@ -1809,6 +1844,102 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                 finish(run_id, outputs=outputs, error=error)
             except Exception:
                 return
+
+
+class QwenDashScopeRewardProvider(DeepSeekRewardProvider):
+    """Qwen3.7-Flash provider using DashScope's native HTTP message protocol."""
+
+    provider_name = QWEN3_7_FLASH_PROVIDER
+    config_provider_name = QWEN_DASHSCOPE_PROVIDER
+    default_api_key_env = "DASHSCOPE_API_KEY"
+
+    def __init__(
+        self,
+        *,
+        base_url: str = QWEN_DASHSCOPE_GENERATION_URL,
+        model: str = QWEN3_7_FLASH_PROVIDER,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(base_url=base_url, model=model, **kwargs)
+
+    def _normalize_url(self, base_url: str) -> str:
+        """DashScope receives requests at the configured native generation endpoint."""
+
+        return base_url.rstrip("/")
+
+    def _build_request_payload(
+        self,
+        *,
+        model: str,
+        messages: Sequence[Mapping[str, Any]],
+        temperature: float,
+        reasoning_effort: str,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        dashscope_messages: list[dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content")
+            if not isinstance(role, str) or not role:
+                raise RewardResponseError("reward request message role must be non-empty")
+            if not isinstance(content, str):
+                raise RewardResponseError("reward request message content must be text")
+            dashscope_messages.append(
+                {
+                    "role": role,
+                    "content": [{"text": content}],
+                }
+            )
+        return {
+            "model": model,
+            "input": {"messages": dashscope_messages},
+            "parameters": {
+                "result_format": "message",
+                "temperature": temperature,
+                "enable_thinking": True,
+                "reasoning_effort": reasoning_effort,
+                "max_completion_tokens": max_tokens,
+                "response_format": {"type": "json_object"},
+                "stream": False,
+            },
+        }
+
+    @staticmethod
+    def _extract_model_text(raw_response: str) -> str:
+        try:
+            outer = json.loads(raw_response)
+        except json.JSONDecodeError:
+            return raw_response
+        if not isinstance(outer, Mapping):
+            return raw_response
+        if "reward" in outer:
+            return raw_response
+        output = outer.get("output")
+        if isinstance(output, Mapping):
+            choices = output.get("choices")
+            if isinstance(choices, list) and choices:
+                first = choices[0]
+                if isinstance(first, Mapping):
+                    message = first.get("message")
+                    if isinstance(message, Mapping):
+                        content = message.get("content")
+                        if isinstance(content, str):
+                            return content
+                        if isinstance(content, list):
+                            parts = [
+                                str(part["text"])
+                                for part in content
+                                if isinstance(part, Mapping)
+                                and isinstance(part.get("text"), str)
+                            ]
+                            if parts:
+                                return "".join(parts)
+            output_text = output.get("text")
+            if isinstance(output_text, str):
+                return output_text
+        raise RewardResponseError(
+            "Qwen DashScope response has no output.choices[0].message.content"
+        )
 
 
 def _ensure_sequence(value: Trajectory | Sequence[Trajectory]) -> tuple[Trajectory, ...]:
@@ -1961,7 +2092,7 @@ def create_reward_provider(
     langsmith_api_key: str | None = None,
     development: bool = False,
 ) -> RewardProvider:
-    """Instantiate the explicitly configured placeholder or DeepSeek provider."""
+    """Instantiate the explicitly configured reward provider."""
 
     provider = getattr(config, "provider", None)
     if provider == "placeholder":
@@ -1984,6 +2115,15 @@ def create_reward_provider(
             langsmith_api_key=langsmith_api_key,
             development=development,
         )
+    if provider == QWEN_DASHSCOPE_PROVIDER:
+        return QwenDashScopeRewardProvider(
+            config=config,
+            api_key=api_key,
+            transport=transport,
+            tracer=tracer,
+            langsmith_api_key=langsmith_api_key,
+            development=development,
+        )
     raise ValueError(f"unsupported reward provider {provider!r}")
 
 
@@ -1994,6 +2134,9 @@ __all__ = [
     "DEEPSEEK_V4_FLASH_PROVIDER",
     "PLACEHOLDER_MARKER",
     "PLACEHOLDER_PROVIDER",
+    "QWEN3_7_FLASH_PROVIDER",
+    "QWEN_DASHSCOPE_GENERATION_URL",
+    "QWEN_DASHSCOPE_PROVIDER",
     "REWARD_PROMPT_VERSION",
     "REWARD_REQUEST_SCHEMA_VERSION",
     "REWARD_RESPONSE_SCHEMA_VERSION",
@@ -2003,6 +2146,7 @@ __all__ = [
     "DeepSeekRewardProvider",
     "LangSmithTracer",
     "PlaceholderRewardProvider",
+    "QwenDashScopeRewardProvider",
     "RewardAggregationError",
     "RewardBatch",
     "RewardError",

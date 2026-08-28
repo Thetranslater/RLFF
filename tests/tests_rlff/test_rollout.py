@@ -19,8 +19,20 @@ from rlff.rollout import (
     RolloutValidationError,
     huggingface_tokenizer_fingerprint,
     rollout_group,
+    rounds_for_character_count,
     validate_rollout_group,
 )
+
+
+@pytest.mark.parametrize(
+    ("character_count", "expected_rounds"),
+    ((1, 7), (2, 7), (3, 6), (4, 5), (5, 5), (6, 5)),
+)
+def test_rounds_are_derived_from_character_count(
+    character_count: int,
+    expected_rounds: int,
+) -> None:
+    assert rounds_for_character_count(character_count) == expected_rounds
 
 
 def episode() -> EpisodeRecord:

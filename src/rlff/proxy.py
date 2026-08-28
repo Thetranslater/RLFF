@@ -18,6 +18,8 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
+from .rollout import rounds_for_character_count
+
 
 class ProxyGroupError(RuntimeError):
     """Raised when one fixed-size proxy group cannot complete atomically."""
@@ -296,24 +298,29 @@ class RLFFGroupAwareAgent:
         self,
         *,
         group_size: int = 4,
-        max_rounds: int = 1,
+        max_rounds: int = 7,
         model: str = "",
         temperature: float = 0.9,
         top_p: float = 1.0,
-        max_new_tokens: int = 512,
-        group_timeout_seconds: float = 3600.0,
+        frequency_penalty: float = 0.0,
+        max_new_tokens: int = 256,
+        group_timeout_seconds: float = 600.0,
+        rollout_request_timeout_seconds: float = 120.0,
         completion_weight: float = 0.6,
         global_weight: float = 0.4,
         min_group_size: int = 2,
         reward_std_epsilon: float = 1e-8,
         system_prompt: str = "",
         reward_provider: ProxyRewardProvider | None = None,
-        reward_provider_name: str = "deepseek",
-        reward_api_key_env: str = "DEEPSEEK_API_KEY",
-        reward_base_url: str = "https://api.deepseek.com",
+        reward_provider_name: str = "qwen_dashscope",
+        reward_api_key_env: str = "DASHSCOPE_API_KEY",
+        reward_base_url: str = (
+            "https://dashscope.aliyuncs.com/api/v1/services/aigc/"
+            "multimodal-generation/generation"
+        ),
         completion_prompt_path: str | None = None,
         trajectory_prompt_path: str | None = None,
-        reward_model: str = "deepseek-v4-flash",
+        reward_model: str = "qwen3.7-flash",
         trajectory_reward_model: str | None = None,
         completion_reward_timeout_seconds: float = 120.0,
         trajectory_reward_timeout_seconds: float | None = None,
@@ -338,13 +345,19 @@ class RLFFGroupAwareAgent:
             raise ValueError("max_rounds must be a positive integer")
         if group_timeout_seconds <= 0:
             raise ValueError("group_timeout_seconds must be positive")
+        if rollout_request_timeout_seconds <= 0:
+            raise ValueError("rollout_request_timeout_seconds must be positive")
+        if not -2 <= frequency_penalty <= 2:
+            raise ValueError("frequency_penalty must be between -2 and 2")
         self.group_size = group_size
         self.max_rounds = max_rounds
         self.model = model
         self.temperature = temperature
         self.top_p = top_p
+        self.frequency_penalty = frequency_penalty
         self.max_new_tokens = max_new_tokens
         self.group_timeout_seconds = group_timeout_seconds
+        self.rollout_request_timeout_seconds = rollout_request_timeout_seconds
         self.completion_weight = completion_weight
         self.global_weight = global_weight
         self.min_group_size = min_group_size
@@ -465,7 +478,7 @@ class RLFFGroupAwareAgent:
         """Generate one trajectory through the exact training rollout path.
 
         This public boundary intentionally skips only the native group barrier,
-        DeepSeek scoring, and advantage normalization.  Prompt rendering,
+        reward-model scoring, and advantage normalization.  Prompt rendering,
         character round-robin order, history accumulation, sampling arguments,
         and the OpenAI-compatible transport are shared with :meth:`run`.
         """
@@ -607,11 +620,11 @@ class RLFFGroupAwareAgent:
                 PlaceholderRewardProvider(allow_placeholder=True),
             )
             return self._reward_provider
-        if self._reward_provider_name != "deepseek":
+        if self._reward_provider_name not in {"deepseek", "qwen_dashscope"}:
             raise ProxyGroupError(
                 f"unsupported proxy reward provider {self._reward_provider_name!r}"
             )
-        from .rewards import DeepSeekRewardProvider
+        from .rewards import DeepSeekRewardProvider, QwenDashScopeRewardProvider
 
         api_key = os.getenv(self._reward_api_key_env)
         langsmith_api_key = (
@@ -621,9 +634,14 @@ class RLFFGroupAwareAgent:
             raise ProxyGroupError(
                 f"LangSmith tracing requires environment variable {self._langsmith_api_key_env}"
             )
+        provider_class = (
+            QwenDashScopeRewardProvider
+            if self._reward_provider_name == "qwen_dashscope"
+            else DeepSeekRewardProvider
+        )
         self._reward_provider = cast(
             ProxyRewardProvider,
-            DeepSeekRewardProvider(
+            provider_class(
                 api_key=api_key,
                 base_url=self._reward_base_url,
                 model=self._reward_model,
@@ -732,12 +750,23 @@ class RLFFGroupAwareAgent:
         model = str(data.get("model") or self.model).strip()
         if not model:
             raise ProxyGroupError("proxy agent requires a model name")
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            http_client=http_client,
+            timeout=self.rollout_request_timeout_seconds,
+            # Let RLFF's group failure path handle retries and wake peer runs.
+            max_retries=0,
+        )
         history: list[DialogueTurn] = list(episode_record.dialogue)
         completions: list[ProxyCompletionView] = []
         generated_turns: list[Mapping[str, Any]] = []
         turn_index = 0
-        for _round_index in range(self.max_rounds):
+        planned_rounds = min(
+            self.max_rounds,
+            rounds_for_character_count(len(characters)),
+        )
+        for _round_index in range(planned_rounds):
             for character in characters:
                 messages = self._messages(episode_record, character, history, render)
                 response = await client.chat.completions.create(
@@ -745,6 +774,7 @@ class RLFFGroupAwareAgent:
                     messages=cast(Any, messages),
                     temperature=self.temperature,
                     top_p=self.top_p,
+                    frequency_penalty=self.frequency_penalty,
                     max_tokens=self.max_new_tokens,
                 )
                 response_id = getattr(response, "id", None)
@@ -778,8 +808,8 @@ class RLFFGroupAwareAgent:
             episode=episode,
             completions=tuple(completions),
             turns=tuple(generated_turns),
-            planned_rounds=self.max_rounds,
-            completed_rounds=self.max_rounds,
+            planned_rounds=planned_rounds,
+            completed_rounds=planned_rounds,
         )
 
     @staticmethod

@@ -13,41 +13,43 @@ prompt:
   default_template_id: sft_system_v1
 
 rollout:
-  max_rounds: 4
+  # Upper bound; actual rounds are 7 (1-2 roles), 6 (3 roles), or 5 (4+ roles).
+  max_rounds: 7
 
 sglang:
   model: models/base/Qwen2.5-7B-Instruct
   base_url: http://127.0.0.1:30000
   temperature: 1.0
   top_p: 0.9
-  max_new_tokens: 512
-  context_length: 5120
+  frequency_penalty: 1.2
+  max_new_tokens: 256
+  context_length: 6144
   timeout_seconds: 120.0
 
 rewards:
   completion:
-    model: deepseek-v4-flash
-    prompt_path: prompts/completion_reward_system.txt
+    model: qwen3.7-flash
+    prompt_path: prompts/completion_reward_system_v2.txt
     timeout_seconds: 120.0
     retries: 2
     concurrency: 4
-    temperature: 1.0
-    reasoning_effort: low
-    max_tokens: 25000
+    temperature: 0.7
+    reasoning_effort: medium
+    max_tokens: 16384
   global_reward:
-    model: deepseek-v4-flash
+    model: qwen3.7-flash
     prompt_path: prompts/trajectory_reward_system.txt
     timeout_seconds: 120.0
     retries: 2
     concurrency: 4
-    temperature: 1.0
-    reasoning_effort: low
-    max_tokens: 25000
+    temperature: 0.7
+    reasoning_effort: medium
+    max_tokens: 16384
   completion_weight: 0.6
   global_weight: 0.4
-  provider: deepseek
-  api_key_env: DEEPSEEK_API_KEY
-  base_url: https://api.deepseek.com
+  provider: qwen_dashscope
+  api_key_env: DASHSCOPE_API_KEY
+  base_url: https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
 
 grpo:
   reward_std_epsilon: 1.0e-8
@@ -85,7 +87,7 @@ areal:
   proxy_mode: inline
   proxy_turn_discount: 0.0
   proxy_export_style: individual
-  proxy_group_timeout_seconds: 3600.0
+  proxy_group_timeout_seconds: 600.0
 
 checkpoint:
   output_dir: outputs/checkpoints

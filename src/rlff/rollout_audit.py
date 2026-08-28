@@ -3,7 +3,7 @@
 Unlike :mod:`rlff.rollout_smoke`, this command intentionally starts the pinned
 AReaL runtime.  It captures the tensors exported by AReaL's
 ``OpenAIProxyWorkflow`` and then runs RLFF's real actor advantage adapter.  No
-DeepSeek request and no optimizer update is performed.
+remote reward request and no optimizer update is performed.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import argparse
 import copy
 import json
 import math
+import random
 import statistics
 import sys
 import time
@@ -29,8 +30,11 @@ from .proxy import (
     DeterministicAuditRewardProvider,
     decode_proxy_episode_payload,
 )
+from .rollout import rounds_for_character_count
 
 AUDIT_SCHEMA_VERSION = "rlff.rollout-audit.v1"
+DEFAULT_EPISODE_COUNT = 20
+DEFAULT_EPISODE_SEED = 42
 _FLOAT_TOLERANCE = 1e-5
 
 
@@ -160,13 +164,14 @@ def audit_rollout_batches(
     context_length: int,
     max_new_tokens: int,
     include_prompt_text: bool = True,
+    validate_episode_structure: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Validate and serialize real AReaL rollout and actor tensors."""
 
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     records: list[dict[str, Any]] = []
-    if not characters:
+    if validate_episode_structure and not characters:
         raise ValueError("at least one character is required for rollout audit")
     if group_size < 2:
         raise ValueError("rollout audit requires group_size >= 2")
@@ -370,19 +375,24 @@ def audit_rollout_batches(
                     ),
                     interaction_index=global_index,
                 )
-            ordinal = slot_ordinals[nearest_slot]
-            slot_ordinals[nearest_slot] += 1
-            round_index = ordinal // len(characters)
-            character_index = ordinal % len(characters)
-            character = characters[character_index]
-            character_counts[character] += 1
-            if round_index >= max_rounds:
-                _record_problem(
-                    errors,
-                    code="too_many_interactions_in_trajectory",
-                    message=f"trajectory slot {nearest_slot} exceeds {max_rounds} rounds",
-                    interaction_index=global_index,
-                )
+            if validate_episode_structure:
+                ordinal = slot_ordinals[nearest_slot]
+                slot_ordinals[nearest_slot] += 1
+                round_index = ordinal // len(characters)
+                character_index = ordinal % len(characters)
+                character = characters[character_index]
+                character_counts[character] += 1
+                if round_index >= max_rounds:
+                    _record_problem(
+                        errors,
+                        code="too_many_interactions_in_trajectory",
+                        message=f"trajectory slot {nearest_slot} exceeds {max_rounds} rounds",
+                        interaction_index=global_index,
+                    )
+            else:
+                ordinal = None
+                round_index = None
+                character = None
 
             trained_mask_full = [float(value) for value in trained_rows["loss_mask"][row_index]]
             trained_logprobs_full = [float(value) for value in trained_rows["logprobs"][row_index]]
@@ -494,33 +504,36 @@ def audit_rollout_batches(
             records.append(record)
             global_index += 1
 
+    if not validate_episode_structure:
+        expected_interactions = global_index
     if global_index != expected_interactions:
         _record_problem(
             errors,
             code="interaction_count_mismatch",
             message=f"observed {global_index} interactions, expected {expected_interactions}",
         )
-    for slot in range(group_size):
-        if slot_ordinals[slot] != turns_per_trajectory:
-            _record_problem(
-                errors,
-                code="trajectory_turn_count_mismatch",
-                message=(
-                    f"trajectory slot {slot} has {slot_ordinals[slot]} interactions, "
-                    f"expected {turns_per_trajectory}"
-                ),
-            )
-    expected_per_character = group_size * max_rounds
-    for character in characters:
-        if character_counts[character] != expected_per_character:
-            _record_problem(
-                errors,
-                code="character_interaction_count_mismatch",
-                message=(
-                    f"{character!r} has {character_counts[character]} interactions, "
-                    f"expected {expected_per_character}"
-                ),
-            )
+    if validate_episode_structure:
+        for slot in range(group_size):
+            if slot_ordinals[slot] != turns_per_trajectory:
+                _record_problem(
+                    errors,
+                    code="trajectory_turn_count_mismatch",
+                    message=(
+                        f"trajectory slot {slot} has {slot_ordinals[slot]} interactions, "
+                        f"expected {turns_per_trajectory}"
+                    ),
+                )
+        expected_per_character = group_size * max_rounds
+        for character in characters:
+            if character_counts[character] != expected_per_character:
+                _record_problem(
+                    errors,
+                    code="character_interaction_count_mismatch",
+                    message=(
+                        f"{character!r} has {character_counts[character]} interactions, "
+                        f"expected {expected_per_character}"
+                    ),
+                )
 
     summary = {
         "schema_version": AUDIT_SCHEMA_VERSION,
@@ -565,6 +578,25 @@ def _default_output_dir() -> Path:
     return Path("outputs") / "rollout-audit" / timestamp
 
 
+def select_episode_indices(
+    dataset: Sequence[Any],
+    *,
+    count: int = DEFAULT_EPISODE_COUNT,
+    seed: int = DEFAULT_EPISODE_SEED,
+) -> tuple[int, ...]:
+    """Select unique episode indexes deterministically from the loaded dataset."""
+
+    if type(count) is not int or count <= 0:
+        raise ValueError("episode count must be a positive integer")
+    if type(seed) is not int or seed < 0:
+        raise ValueError("episode seed must be a non-negative integer")
+    if count > len(dataset):
+        raise ValueError(
+            f"cannot sample {count} episodes from dataset of size {len(dataset)}"
+        )
+    return tuple(random.Random(seed).sample(range(len(dataset)), count))
+
+
 def _write_outputs(
     output_dir: Path,
     records: Sequence[Mapping[str, Any]],
@@ -584,7 +616,7 @@ def _write_outputs(
         f"- Interactions: `{summary['interactions']}/{summary['expected_interactions']}`",
         f"- Group size: `{summary['group_size']}`",
         f"- Max rounds: `{summary['max_rounds']}`",
-        f"- Characters: `{', '.join(summary['characters'])}`",
+        f"- Characters: `{', '.join(summary['characters']) or 'not mapped in batch mode'}`",
         f"- Policy versions: `{summary['policy_versions']}`",
         f"- Errors: `{len(summary['errors'])}`",
         f"- Warnings: `{len(summary['warnings'])}`",
@@ -609,29 +641,27 @@ def _write_outputs(
 def run_cloud_audit(
     config: RLFFConfig,
     *,
-    episode_index: int,
+    episode_count: int = DEFAULT_EPISODE_COUNT,
+    seed: int = DEFAULT_EPISODE_SEED,
+    episode_index: int | None = None,
     output_dir: Path,
     include_prompt_text: bool,
 ) -> dict[str, Any]:
-    """Launch one real AReaL rollout group and audit its exported tensors."""
+    """Launch real AReaL rollout groups and audit their exported tensors."""
 
     from . import runtime
     from .proxy import RLFFGroupAwareAgent
 
     dataset = runtime.build_areal_training_dataset(config)
-    if episode_index < 0 or episode_index >= len(dataset):
-        raise IndexError(
-            f"episode-index {episode_index} is outside dataset range 0..{len(dataset) - 1}"
-        )
-    selected_dataset = dataset.select([episode_index])
-    row = dataset[episode_index]
-    episode = decode_proxy_episode_payload(row)
-    raw_characters = episode.get("characters")
-    if not isinstance(raw_characters, Sequence) or isinstance(
-        raw_characters, (str, bytes, bytearray)
-    ):
-        raise ValueError("selected episode has no ordered characters")
-    characters = tuple(str(item["name"]) for item in raw_characters)
+    if episode_index is not None:
+        if episode_index < 0 or episode_index >= len(dataset):
+            raise IndexError(
+                f"episode-index {episode_index} is outside dataset range 0..{len(dataset) - 1}"
+            )
+        selected_indices = (episode_index,)
+    else:
+        selected_indices = select_episode_indices(dataset, count=episode_count, seed=seed)
+    selected_dataset = dataset.select(list(selected_indices))
 
     group_size = config.episode_grouping.group_size
     if group_size < 2:
@@ -648,12 +678,35 @@ def run_cloud_audit(
         raise TypeError("rollout audit workflow arguments must be JSON serializable") from exc
 
     started = datetime.now(UTC)
+    rows = [dataset[index] for index in selected_indices]
+    strict_episode_audit = len(rows) == 1
+    characters: tuple[str, ...] = ()
+    if strict_episode_audit:
+        episode = decode_proxy_episode_payload(rows[0])
+        raw_characters = episode.get("characters")
+        if not isinstance(raw_characters, Sequence) or isinstance(
+            raw_characters, (str, bytes, bytearray)
+        ):
+            raise ValueError("selected episode has no ordered characters")
+        characters = tuple(str(item["name"]) for item in raw_characters)
+    audit_max_rounds = config.rollout.max_rounds
+    if characters:
+        audit_max_rounds = min(
+            audit_max_rounds,
+            rounds_for_character_count(len(characters)),
+        )
+
     with trainer_class(
         native_config,
         train_dataset=selected_dataset,
         valid_dataset=None,
     ) as trainer:
         trainer._ensure_proxy_started()
+        print(
+            f"submitting rollout batch: episodes={len(rows)} group_size={group_size}",
+            file=sys.stderr,
+            flush=True,
+        )
         rollout_onloaded = False
         raw_batches: Sequence[Mapping[str, Any]] = []
         training_batches: Sequence[Mapping[str, Any]] = []
@@ -662,7 +715,7 @@ def run_cloud_audit(
                 trainer._onload_rollout()
                 rollout_onloaded = True
             raw_batches = trainer.actor.rollout_batch(
-                [row],
+                rows,
                 workflow=RLFFGroupAwareAgent,
                 workflow_kwargs=workflow_kwargs,
                 group_size=group_size,
@@ -672,11 +725,28 @@ def run_cloud_audit(
                     "AReaL rollout_batch returned no interaction batches; inspect the "
                     "rollout/controller logs for the preceding workflow failure"
                 )
+            print(
+                f"rollout batch returned: batches={len(raw_batches)}",
+                file=sys.stderr,
+                flush=True,
+            )
             training_input = _clone_batches(raw_batches)
             training_batches = trainer.actor.compute_advantages(training_input)
             local_raw_batches, local_training_batches = _localize_areal_batches(
                 raw_batches,
                 training_batches,
+            )
+            records, summary = audit_rollout_batches(
+                local_raw_batches,
+                local_training_batches,
+                tokenizer=trainer.tokenizer,
+                characters=characters,
+                group_size=group_size,
+                max_rounds=audit_max_rounds,
+                context_length=config.sglang.context_length,
+                max_new_tokens=config.sglang.max_new_tokens,
+                include_prompt_text=include_prompt_text,
+                validate_episode_structure=strict_episode_audit,
             )
         finally:
             if raw_batches:
@@ -693,31 +763,23 @@ def run_cloud_audit(
             if rollout_onloaded:
                 trainer._offload_rollout()
 
-        records, summary = audit_rollout_batches(
-            local_raw_batches,
-            local_training_batches,
-            tokenizer=trainer.tokenizer,
-            characters=characters,
-            group_size=group_size,
-            max_rounds=config.rollout.max_rounds,
-            context_length=config.sglang.context_length,
-            max_new_tokens=config.sglang.max_new_tokens,
-            include_prompt_text=include_prompt_text,
-        )
-
     finished = datetime.now(UTC)
+    summary["episodes"] = len(selected_indices)
+    summary["episode_indices"] = list(selected_indices)
+    summary["batch_episode_mapping"] = False
     summary.update(
         {
             "started_at": started.isoformat(),
             "finished_at": finished.isoformat(),
             "elapsed_seconds": round((finished - started).total_seconds(), 6),
+            "episode_count": len(selected_indices),
+            "selection_seed": None if episode_index is not None else seed,
+            "requested_episode_count": 1 if episode_index is not None else episode_count,
             "episode_index": episode_index,
-            "episode_id": str(episode.get("episode_id", "")),
-            "episode_title": str(episode.get("title", "")),
             "config_fingerprint": config.config_fingerprint(),
             "output_dir": str(output_dir),
             "reward_provider": "deterministic_local_audit",
-            "deepseek_called": False,
+            "remote_reward_called": False,
             "optimizer_update_performed": False,
             "include_prompt_text": include_prompt_text,
         }
@@ -729,7 +791,23 @@ def run_cloud_audit(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--episode-index", type=int, default=0)
+    parser.add_argument(
+        "--episode-count",
+        type=int,
+        default=DEFAULT_EPISODE_COUNT,
+        help=f"number of unique episodes to sample (default: {DEFAULT_EPISODE_COUNT})",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_EPISODE_SEED,
+        help=f"random seed for episode sampling (default: {DEFAULT_EPISODE_SEED})",
+    )
+    parser.add_argument(
+        "--episode-index",
+        type=int,
+        help="audit exactly one episode; overrides --episode-count and --seed",
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
         "--include-prompt-text",
@@ -749,6 +827,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         started = time.perf_counter()
         summary = run_cloud_audit(
             config,
+            episode_count=args.episode_count,
+            seed=args.seed,
             episode_index=args.episode_index,
             output_dir=output_dir,
             include_prompt_text=args.include_prompt_text,
@@ -784,8 +864,11 @@ if __name__ == "__main__":  # pragma: no cover - exercised by cloud command
 
 __all__ = [
     "AUDIT_SCHEMA_VERSION",
+    "DEFAULT_EPISODE_COUNT",
+    "DEFAULT_EPISODE_SEED",
     "DeterministicAuditRewardProvider",
     "audit_rollout_batches",
     "main",
     "run_cloud_audit",
+    "select_episode_indices",
 ]

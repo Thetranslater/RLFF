@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -133,12 +134,14 @@ def test_agent_workflow_kwargs_include_reward_sampling_settings(tmp_path: Path) 
 
     kwargs = runtime.build_agent_workflow_kwargs(config)
 
-    assert kwargs["completion_reward_temperature"] == 1.0
-    assert kwargs["trajectory_reward_temperature"] == 1.0
-    assert kwargs["completion_reward_reasoning_effort"] == "low"
-    assert kwargs["trajectory_reward_reasoning_effort"] == "low"
-    assert kwargs["completion_reward_max_tokens"] == 25000
-    assert kwargs["trajectory_reward_max_tokens"] == 25000
+    assert kwargs["completion_reward_temperature"] == 0.7
+    assert kwargs["trajectory_reward_temperature"] == 0.7
+    assert kwargs["completion_reward_reasoning_effort"] == "medium"
+    assert kwargs["trajectory_reward_reasoning_effort"] == "medium"
+    assert kwargs["completion_reward_max_tokens"] == 16384
+    assert kwargs["trajectory_reward_max_tokens"] == 16384
+    assert kwargs["frequency_penalty"] == 0.0
+    assert kwargs["rollout_request_timeout_seconds"] == 120.0
 
 
 def test_runtime_plan_rejects_nondefault_proxy_lora_name(
@@ -611,7 +614,64 @@ def test_public_generate_trajectory_uses_training_runner_without_reward_barrier(
     assert result.trajectory_id == "trajectory-smoke"
     assert len(calls) == 1
     assert calls[0]["group_id"] == "group-1"
-    assert calls[0]["max_rounds"] == 1
+    assert calls[0]["max_rounds"] == 7
+
+
+def test_openai_rollout_uses_explicit_request_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeCompletions:
+        async def create(self, **_kwargs: Any) -> Any:
+            captured["request"] = _kwargs
+            return SimpleNamespace(
+                id="completion-1",
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="ok"),
+                        finish_reason="stop",
+                    )
+                ],
+            )
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    fake_openai = ModuleType("openai")
+    fake_openai.AsyncOpenAI = FakeAsyncOpenAI  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    agent = RLFFGroupAwareAgent(
+        group_size=4,
+        max_rounds=1,
+        model="test-model",
+        frequency_penalty=1.5,
+        rollout_request_timeout_seconds=7.5,
+    )
+    result = asyncio.run(
+        agent.generate_trajectory(
+            {
+                "group_id": "group-1",
+                "episode": {
+                    "episode_id": "episode-1",
+                    "title": "test",
+                    "plot": "test plot",
+                    "characters": [{"name": "Alice", "profile": "profile"}],
+                },
+            },
+            base_url="http://sglang/v1",
+            http_client=object(),
+            api_key="EMPTY",
+        )
+    )
+
+    assert len(result.completions) == 1
+    assert captured["timeout"] == 7.5
+    assert captured["max_retries"] == 0
+    assert captured["request"]["frequency_penalty"] == 1.5
 
 
 def test_proxy_prompt_uses_canonical_target_projection() -> None:

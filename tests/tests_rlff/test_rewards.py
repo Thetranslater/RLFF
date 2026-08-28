@@ -18,6 +18,7 @@ from rlff.contracts import (
 from rlff.rewards import (
     DeepSeekRewardProvider,
     PlaceholderRewardProvider,
+    QwenDashScopeRewardProvider,
     RewardAggregationError,
     RewardHTTPResponse,
     RewardPromptError,
@@ -108,6 +109,18 @@ def completion_model_response(value: int, *, count: int = 1) -> str:
 def trajectory_model_response(tasks: list[str], values: list[int]) -> str:
     score = [{"task": task, "value": str(value)} for task, value in zip(tasks, values, strict=True)]
     return json.dumps({"choices": [{"message": {"content": json.dumps({"score": score})}}]})
+
+
+def dashscope_model_response(content: dict[str, object]) -> str:
+    return json.dumps(
+        {
+            "output": {
+                "choices": [
+                    {"message": {"role": "assistant", "content": json.dumps(content)}}
+                ]
+            }
+        }
+    )
 
 
 class FakeTransport:
@@ -229,11 +242,11 @@ def test_completion_and_trajectory_payloads_isolate_private_tasks() -> None:
     assert "bob-secret" not in local_text
     assert trajectory_payload["tasks"] == ["keep the scene coherent", "alice-secret"]
     assert "bob-secret" not in json.dumps(trajectory_payload)
-    assert sample.completions[1].text in trajectory_payload["input"]["history"]
-    assert sample.completions[0].text in local["input"]["history"]
-    assert sample.completions[1].text in local["input"]["history"]
+    assert sample.completions[1].text in trajectory_payload["input"]["utterances"]
+    assert sample.completions[0].text in local["input"]["utterances"]
+    assert sample.completions[1].text in local["input"]["utterances"]
     assert local["ids"]["completion_ids"] == [sample.completions[0].completion_id]
-    assert set(local["input"]) == {"history"}
+    assert set(local["input"]) == {"utterances"}
 
 
 @pytest.mark.asyncio
@@ -333,8 +346,8 @@ async def test_deepseek_http_retry_and_scope_specific_payload_messages() -> None
     assert trajectory_role_reward.reward == 4.0
     local_body = json.loads(transport.calls[1]["payload"]["messages"][1]["content"])
     trajectory_body = json.loads(transport.calls[2]["payload"]["messages"][1]["content"])
-    assert set(local_body) == {"history"}
-    assert set(trajectory_body) == {"history"}
+    assert set(local_body) == {"utterances"}
+    assert set(trajectory_body) == {"utterances"}
     assert "角色=Alice" in transport.calls[1]["payload"]["messages"][0]["content"]
     assert "alice-secret" in transport.calls[2]["payload"]["messages"][0]["content"]
     assert transport.calls[1]["payload"]["temperature"] == 1.0
@@ -343,6 +356,57 @@ async def test_deepseek_http_retry_and_scope_specific_payload_messages() -> None
     assert transport.calls[2]["payload"]["reasoning_effort"] == "low"
     assert transport.calls[1]["payload"]["max_tokens"] == 25000
     assert transport.calls[2]["payload"]["max_tokens"] == 25000
+
+
+@pytest.mark.asyncio
+async def test_qwen_uses_native_dashscope_messages_and_response_envelope() -> None:
+    source = episode()
+    sample = trajectory(source)
+    tasks = ["keep the scene coherent", "alice-secret"]
+    transport = FakeTransport(
+        [
+            dashscope_model_response({"scores": [{"values": [4, 4, 4, 4]}]}),
+            dashscope_model_response(
+                {
+                    "score": [
+                        {"task": task, "value": value}
+                        for task, value in zip(tasks, [5, 3], strict=True)
+                    ]
+                }
+            ),
+        ]
+    )
+    provider = QwenDashScopeRewardProvider(
+        api_key="dashscope-key",
+        completion_prompt=COMPLETION_PROMPT,
+        trajectory_prompt=TRAJECTORY_PROMPT,
+        completion_temperature=0.7,
+        completion_reasoning_effort="medium",
+        completion_max_tokens=16384,
+        transport=transport,
+    )
+
+    local = await provider.score_completion(source, sample, sample.completions[0])
+    trajectory_reward = await provider.score_trajectory(source, sample, "Alice")
+
+    assert local.status is RewardStatus.VALID and local.reward == 3.75
+    assert trajectory_reward.status is RewardStatus.VALID and trajectory_reward.reward == 4.0
+    assert all(not str(call["url"]).endswith("/chat/completions") for call in transport.calls)
+    request = transport.calls[0]["payload"]
+    assert "messages" not in request
+    assert request["model"] == "qwen3.7-flash"
+    assert request["input"]["messages"][0]["role"] == "system"
+    assert isinstance(request["input"]["messages"][0]["content"], list)
+    assert request["parameters"] == {
+        "result_format": "message",
+        "temperature": 0.7,
+        "enable_thinking": True,
+        "reasoning_effort": "medium",
+        "max_completion_tokens": 16384,
+        "response_format": {"type": "json_object"},
+        "stream": False,
+    }
+    assert transport.calls[0]["headers"]["Authorization"] == "Bearer dashscope-key"
 
 
 @pytest.mark.asyncio
