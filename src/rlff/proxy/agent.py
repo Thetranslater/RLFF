@@ -1,349 +1,34 @@
-"""AReaL OpenAI-proxy agent and group-local reward normalization.
+"""AReaL OpenAI-proxy group-aware rollout agent.
 
-The official AReaL wrapper owns proxy sessions, reward assignment, session
-shutdown, and exact interaction export.  This module only supplies the
-agent-like ``run`` implementation used by that wrapper.  It deliberately
-keeps the reward views text-only: token IDs and log-probabilities are never
-reconstructed here and arrive only from AReaL's proxy export.
+This file is part of the deploy-only RLFF implementation. Keep changes here;
+the repository-level src/rlff tree is intentionally not synchronized.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
-import json
-import logging
-import math
 import os
-import random
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
-from .rollout import rounds_for_character_count
-
-logger = logging.getLogger(__name__)
-
-
-def _group_character_order(characters: Sequence[str], group_key: str) -> tuple[str, ...]:
-    """Return one reproducible shuffled order shared by a native GRPO group."""
-
-    ordered = list(characters)
-    if len(ordered) < 2:
-        return tuple(ordered)
-    seed = int.from_bytes(
-        hashlib.sha256(f"rlff-character-order:{group_key}".encode()).digest()[:8],
-        "big",
-    )
-    random.Random(seed).shuffle(ordered)
-    return tuple(ordered)
-
-
-def reward_weights_for_step(
-    step: int,
-    *,
-    completion_start_weight: float,
-    global_start_weight: float,
-    schedule_start_step: int | None = None,
-    schedule_end_step: int | None = None,
-    completion_end_weight: float | None = None,
-    global_end_weight: float | None = None,
-) -> tuple[float, float]:
-    """Return constant or linearly interpolated reward weights for one update step."""
-
-    if type(step) is not int or step < 0:
-        raise ValueError("reward schedule step must be a non-negative integer")
-    start_weights = (
-        _finite(completion_start_weight, field="completion_start_weight"),
-        _finite(global_start_weight, field="global_start_weight"),
-    )
-    schedule = (
-        schedule_start_step,
-        schedule_end_step,
-        completion_end_weight,
-        global_end_weight,
-    )
-    if all(value is None for value in schedule):
-        return start_weights
-    if any(value is None for value in schedule):
-        raise ValueError("reward weight schedule fields must be supplied together")
-    assert schedule_start_step is not None
-    assert schedule_end_step is not None
-    assert completion_end_weight is not None
-    assert global_end_weight is not None
-    if schedule_start_step < 0 or schedule_end_step <= schedule_start_step:
-        raise ValueError("reward schedule requires 0 <= start_step < end_step")
-    end_weights = (
-        _finite(completion_end_weight, field="completion_end_weight"),
-        _finite(global_end_weight, field="global_end_weight"),
-    )
-    if any(value < 0 for value in (*start_weights, *end_weights)):
-        raise ValueError("reward weights must be non-negative")
-    if step <= schedule_start_step:
-        return start_weights
-    if step >= schedule_end_step:
-        return end_weights
-    progress = (step - schedule_start_step) / (schedule_end_step - schedule_start_step)
-    completion_weight = start_weights[0] + (end_weights[0] - start_weights[0]) * progress
-    global_weight = start_weights[1] + (end_weights[1] - start_weights[1]) * progress
-    return completion_weight, global_weight
-
-
-class ProxyGroupError(RuntimeError):
-    """Raised when one fixed-size proxy group cannot complete atomically."""
-
-
-@dataclass(frozen=True, slots=True)
-class ProxyCompletionView:
-    """Text-only completion metadata available before official proxy export."""
-
-    completion_id: str
-    group_id: str
-    trajectory_id: str
-    character: str
-    turn_index: int
-    text: str
-    finish_reason: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ProxyTrajectoryView:
-    """Text-only trajectory view used by reward prompts and normalization."""
-
-    group_id: str
-    trajectory_id: str
-    episode_id: str
-    episode: Mapping[str, Any]
-    completions: tuple[ProxyCompletionView, ...]
-    turns: tuple[Mapping[str, Any], ...]
-    planned_rounds: int
-    completed_rounds: int
-    termination_reason: str = "max_rounds"
-    valid: bool = True
-    truncated: bool = False
-    invalid_reason: str | None = None
-
-
-class ProxyRewardProvider(Protocol):
-    """Narrow runtime reward interface; no CompletionTrace is fabricated."""
-
-    async def score_proxy_completion_role(
-        self,
-        payload: Mapping[str, Any],
-    ) -> Mapping[str, float]: ...
-
-    async def score_proxy_trajectory_role(self, payload: Mapping[str, Any]) -> float: ...
-
-
-DETERMINISTIC_AUDIT_REWARD_PROVIDER = "deterministic_audit"
-
-
-class DeterministicAuditRewardProvider:
-    """Assign deterministic trajectory-slot scores for the cloud rollout audit.
-
-    AReaL serializes workflow keyword arguments before sending them to rollout
-    workers, so the audit passes only ``reward_provider_name`` over RPC.  The
-    worker constructs this provider locally through ``_get_reward_provider``.
-    """
-
-    @staticmethod
-    def _slot(payload: Mapping[str, Any]) -> int:
-        identifiers = payload.get("ids")
-        if not isinstance(identifiers, Mapping):
-            raise ValueError("audit reward payload is missing ids")
-        trajectory_id = str(identifiers.get("trajectory_id", ""))
-        prefix, separator, slot = trajectory_id.rpartition(":trajectory:")
-        if not separator or not prefix or not slot.isdigit():
-            raise ValueError(f"cannot extract trajectory slot from {trajectory_id!r}")
-        return int(slot)
-
-    async def score_proxy_completion_role(self, payload: Mapping[str, Any]) -> dict[str, float]:
-        identifiers = payload.get("ids")
-        if not isinstance(identifiers, Mapping):
-            raise ValueError("audit completion payload is missing ids")
-        completion_ids = identifiers.get("completion_ids")
-        if not isinstance(completion_ids, Sequence) or isinstance(
-            completion_ids, (str, bytes, bytearray)
-        ):
-            raise ValueError("audit completion payload has invalid completion_ids")
-        value = float(self._slot(payload))
-        return {str(completion_id): value for completion_id in completion_ids}
-
-    async def score_proxy_trajectory_role(self, payload: Mapping[str, Any]) -> float:
-        return float(self._slot(payload))
-
-
-ProxyTrajectoryRunner = Callable[..., ProxyTrajectoryView | Awaitable[ProxyTrajectoryView]]
-
-
-def _finite(value: Any, *, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ProxyGroupError(f"{field} must be numeric")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ProxyGroupError(f"{field} must be finite")
-    return result
-
-
-def _mapping_value(value: Any, key: str, default: Any = None) -> Any:
-    if isinstance(value, Mapping):
-        return value.get(key, default)
-    return getattr(value, key, default)
-
-
-def decode_proxy_episode_payload(data: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Decode an episode transported either as a mapping or opaque JSON.
-
-    Hugging Face Datasets normalizes nested mapping schemas across all rows and
-    inserts null values for missing keys.  Canonical episodes are therefore
-    transported through AReaL as JSON strings so their fingerprints survive
-    the Arrow round trip unchanged.  Mapping input remains supported for the
-    direct smoke-test and unit-test paths.
-    """
-
-    raw: Any = data.get("episode", data)
-    if hasattr(raw, "model_dump"):
-        raw = raw.model_dump(mode="json")
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ProxyGroupError("rollout data episode JSON is invalid") from exc
-    if not isinstance(raw, Mapping):
-        raise ProxyGroupError("rollout data episode must be a mapping or JSON object")
-    return cast(Mapping[str, Any], dict(raw))
-
-
-def normalize_proxy_role_advantages(
-    trajectories: Sequence[ProxyTrajectoryView],
-    completion_rewards: Mapping[str, float],
-    trajectory_role_rewards: Mapping[tuple[str, str], float],
-    *,
-    completion_weight: float = 0.6,
-    global_weight: float = 0.4,
-    min_group_size: int = 2,
-    reward_std_epsilon: float = 1e-8,
-) -> dict[str, float]:
-    """Aggregate then normalize role rewards for one complete proxy group.
-
-    Local completion scores are first averaged by ``(trajectory, character)``;
-    the same character's full-trajectory task score is then combined.  Only after that step are
-    values normalized independently by ``(group_id, character)``.  Every
-    completion belonging to one trajectory/character receives exactly the
-    same resulting scalar.
-    """
-
-    if not trajectories:
-        raise ProxyGroupError("proxy group must contain at least one trajectory")
-    if type(min_group_size) is not int or min_group_size <= 0:
-        raise ProxyGroupError("min_group_size must be a positive integer")
-    completion_weight = _finite(completion_weight, field="completion_weight")
-    global_weight = _finite(global_weight, field="global_weight")
-    epsilon = _finite(reward_std_epsilon, field="reward_std_epsilon")
-    if completion_weight < 0 or global_weight < 0:
-        raise ProxyGroupError("reward weights must be non-negative")
-    if epsilon < 0:
-        raise ProxyGroupError("reward_std_epsilon must be non-negative")
-
-    first_group = trajectories[0].group_id
-    if any(item.group_id != first_group for item in trajectories):
-        raise ProxyGroupError("all proxy trajectories must belong to one group")
-    role_values: dict[tuple[str, str], float] = {}
-    role_completion_ids: dict[tuple[str, str], tuple[str, ...]] = {}
-    role_order: list[str] = []
-    seen_trajectory_ids: set[str] = set()
-    seen_completion_ids: set[str] = set()
-    for trajectory in trajectories:
-        if trajectory.trajectory_id in seen_trajectory_ids:
-            raise ProxyGroupError("proxy group contains duplicate trajectory IDs")
-        seen_trajectory_ids.add(trajectory.trajectory_id)
-        if not trajectory.valid or trajectory.truncated:
-            raise ProxyGroupError(
-                f"trajectory {trajectory.trajectory_id!r} is invalid or truncated"
-            )
-        if (
-            trajectory.termination_reason != "max_rounds"
-            or trajectory.completed_rounds != trajectory.planned_rounds
-        ):
-            raise ProxyGroupError(
-                f"trajectory {trajectory.trajectory_id!r} did not complete max_rounds"
-            )
-        by_character: dict[str, list[ProxyCompletionView]] = {}
-        for completion in trajectory.completions:
-            if completion.group_id != first_group:
-                raise ProxyGroupError("completion group differs from trajectory group")
-            if completion.trajectory_id != trajectory.trajectory_id:
-                raise ProxyGroupError("completion trajectory differs from trajectory")
-            if not completion.character or completion.character.casefold() == "environment":
-                raise ProxyGroupError("Environment/narrator completions are forbidden")
-            if completion.completion_id in seen_completion_ids:
-                raise ProxyGroupError("proxy group contains duplicate completion IDs")
-            seen_completion_ids.add(completion.completion_id)
-            if completion.completion_id in completion_rewards:
-                by_character.setdefault(completion.character, []).append(completion)
-            else:
-                raise ProxyGroupError(f"missing completion reward {completion.completion_id!r}")
-        if not by_character:
-            raise ProxyGroupError(f"trajectory {trajectory.trajectory_id!r} has no completions")
-        for character, completions in by_character.items():
-            if character not in role_order:
-                role_order.append(character)
-            local_values = [
-                _finite(
-                    completion_rewards[completion.completion_id],
-                    field=f"completion reward {completion.completion_id}",
-                )
-                for completion in completions
-            ]
-            local_mean = sum(local_values) / len(local_values)
-            key = (trajectory.trajectory_id, character)
-            trajectory_role_reward = _finite(
-                trajectory_role_rewards.get(key),
-                field=f"trajectory role reward {trajectory.trajectory_id}/{character}",
-            )
-            role_values[key] = (
-                completion_weight * local_mean + global_weight * trajectory_role_reward
-            )
-            role_completion_ids[key] = tuple(item.completion_id for item in completions)
-
-    expected_roles = set(role_order)
-    if len(trajectories) < min_group_size:
-        raise ProxyGroupError(
-            f"proxy group has {len(trajectories)} trajectories; minimum is {min_group_size}"
-        )
-    for trajectory in trajectories:
-        actual = {
-            character
-            for (trajectory_id, character) in role_values
-            if trajectory_id == trajectory.trajectory_id
-        }
-        if actual != expected_roles:
-            raise ProxyGroupError(
-                f"trajectory {trajectory.trajectory_id!r} role set differs from group"
-            )
-
-    result: dict[str, float] = {}
-    for character in role_order:
-        records = [
-            (trajectory.trajectory_id, role_values[(trajectory.trajectory_id, character)])
-            for trajectory in trajectories
-        ]
-        mean = sum(value for _, value in records) / len(records)
-        variance = sum((value - mean) ** 2 for _, value in records) / len(records)
-        std = math.sqrt(variance)
-        for trajectory_id, value in records:
-            advantage = 0.0 if std <= epsilon else (value - mean) / std
-            for completion_id in role_completion_ids[(trajectory_id, character)]:
-                result[completion_id] = advantage
-    expected_ids = {
-        completion.completion_id
-        for trajectory in trajectories
-        for completion in trajectory.completions
-    }
-    if set(result) != expected_ids:
-        raise ProxyGroupError("normalized reward mapping does not cover exactly the group")
-    return result
+from ..rollout import rounds_for_character_count
+from .grouping import _group_character_order, logger, reward_weights_for_step
+from .normalization import (
+    _mapping_value,
+    decode_proxy_episode_payload,
+    normalize_proxy_role_advantages,
+)
+from .types import (
+    DETERMINISTIC_AUDIT_REWARD_PROVIDER,
+    DeterministicAuditRewardProvider,
+    ProxyCompletionView,
+    ProxyGroupError,
+    ProxyRewardProvider,
+    ProxyTrajectoryRunner,
+    ProxyTrajectoryView,
+)
 
 
 @dataclass(slots=True)
@@ -391,8 +76,7 @@ class RLFFGroupAwareAgent:
         reward_provider_name: str = "qwen_dashscope",
         reward_api_key_env: str = "DASHSCOPE_API_KEY",
         reward_base_url: str = (
-            "https://dashscope.aliyuncs.com/api/v1/services/aigc/"
-            "multimodal-generation/generation"
+            "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
         ),
         completion_prompt_path: str | None = None,
         trajectory_prompt_path: str | None = None,
@@ -763,7 +447,7 @@ class RLFFGroupAwareAgent:
             self._reward_provider = DeterministicAuditRewardProvider()
             return self._reward_provider
         if self._reward_provider_name == "placeholder":
-            from .rewards import PlaceholderRewardProvider
+            from ..rewards import PlaceholderRewardProvider
 
             self._reward_provider = cast(
                 ProxyRewardProvider,
@@ -774,7 +458,7 @@ class RLFFGroupAwareAgent:
             raise ProxyGroupError(
                 f"unsupported proxy reward provider {self._reward_provider_name!r}"
             )
-        from .rewards import DeepSeekRewardProvider, QwenDashScopeRewardProvider
+        from ..rewards import DeepSeekRewardProvider, QwenDashScopeRewardProvider
 
         api_key = os.getenv(self._reward_api_key_env)
         langsmith_api_key = (
@@ -825,7 +509,7 @@ class RLFFGroupAwareAgent:
     def _proxy_completion_payload(
         trajectory: ProxyTrajectoryView, character: str
     ) -> Mapping[str, Any]:
-        from .rewards import build_proxy_completion_reward_payload
+        from ..rewards import build_proxy_completion_reward_payload
 
         return build_proxy_completion_reward_payload(
             trajectory.episode,
@@ -837,7 +521,7 @@ class RLFFGroupAwareAgent:
     def _proxy_trajectory_payload(
         trajectory: ProxyTrajectoryView, character: str
     ) -> Mapping[str, Any]:
-        from .rewards import build_proxy_trajectory_reward_payload
+        from ..rewards import build_proxy_trajectory_reward_payload
 
         return build_proxy_trajectory_reward_payload(
             trajectory.episode,
@@ -889,8 +573,8 @@ class RLFFGroupAwareAgent:
     ) -> ProxyTrajectoryView:
         from openai import AsyncOpenAI
 
-        from .config import DEFAULT_PROMPT_TEMPLATE
-        from .contracts import DialogueTurn, EpisodeRecord, PromptRenderSpec
+        from ..config import DEFAULT_PROMPT_TEMPLATE
+        from ..contracts import DialogueTurn, EpisodeRecord, PromptRenderSpec
 
         episode = self._episode_payload(data)
         try:
@@ -1014,8 +698,8 @@ class RLFFGroupAwareAgent:
         history: Sequence[Any],
         render: Any,
     ) -> list[dict[str, str]]:
-        from .contracts import EpisodeRecord
-        from .episodes import project_target_prompt
+        from ..contracts import EpisodeRecord
+        from ..episodes import project_target_prompt
 
         if not isinstance(episode, EpisodeRecord):
             raise ProxyGroupError("prompt projection requires EpisodeRecord")
@@ -1030,18 +714,3 @@ class RLFFGroupAwareAgent:
             cast(dict[str, str], message.model_dump(mode="json", exclude_none=True))
             for message in projection.messages
         ]
-
-
-__all__ = [
-    "DETERMINISTIC_AUDIT_REWARD_PROVIDER",
-    "DeterministicAuditRewardProvider",
-    "ProxyCompletionView",
-    "ProxyGroupError",
-    "ProxyRewardProvider",
-    "ProxyTrajectoryRunner",
-    "ProxyTrajectoryView",
-    "RLFFGroupAwareAgent",
-    "decode_proxy_episode_payload",
-    "normalize_proxy_role_advantages",
-    "reward_weights_for_step",
-]

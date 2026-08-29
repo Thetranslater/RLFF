@@ -312,6 +312,8 @@ def test_existing_adapter_wrapper_passes_trainable_branch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from rlff.runtime import integration
+
     config, _ = _write_runtime_files(tmp_path)
     calls: list[dict[str, object]] = []
 
@@ -321,7 +323,7 @@ def test_existing_adapter_wrapper_passes_trainable_branch(
             calls.append({"model": model, "path": path, **kwargs})
             return (model, kwargs["is_trainable"])
 
-    monkeypatch.setattr(runtime, "_load_peft_model", lambda: FakePeft)
+    monkeypatch.setattr(integration, "_load_peft_model", lambda: FakePeft)
     runtime.apply_existing_sft_adapter(
         "actor", adapter_path=config.lora.sft_adapter_path, is_trainable=True
     )
