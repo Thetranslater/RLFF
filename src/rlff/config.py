@@ -195,6 +195,30 @@ class RewardScopeConfig(ConfigModel):
         return value
 
 
+class RewardWeightScheduleConfig(ConfigModel):
+    """Linear curriculum for completion/trajectory reward mixing."""
+
+    start_step: _NON_NEGATIVE_INT
+    end_step: _NON_NEGATIVE_INT
+    completion_end_weight: StrictFloat
+    global_end_weight: StrictFloat
+
+    @field_validator("completion_end_weight", "global_end_weight")
+    @classmethod
+    def end_weights_are_non_negative(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("scheduled reward weights must be non-negative")
+        return value
+
+    @model_validator(mode="after")
+    def validate_schedule(self) -> RewardWeightScheduleConfig:
+        if self.end_step <= self.start_step:
+            raise ValueError("reward weight schedule end_step must be greater than start_step")
+        if self.completion_end_weight == 0 and self.global_end_weight == 0:
+            raise ValueError("at least one scheduled end weight must be positive")
+        return self
+
+
 class RewardConfig(ConfigModel):
     """Completion/role-task provider settings and explicit placeholder opt-in.
 
@@ -206,8 +230,10 @@ class RewardConfig(ConfigModel):
     global_reward: RewardScopeConfig = Field(
         validation_alias=AliasChoices("global_reward", "global")
     )
+    repair_prompt_path: Path = Path("prompts/error_system.txt")
     completion_weight: StrictFloat = 0.6
     global_weight: StrictFloat = 0.4
+    weight_schedule: RewardWeightScheduleConfig | None = None
     provider: Literal["qwen_dashscope", "deepseek", "placeholder"] = "qwen_dashscope"
     allow_placeholder: StrictBool = Field(
         default=False,
@@ -378,12 +404,20 @@ class CheckpointConfig(ConfigModel):
 
 
 class ObservabilityConfig(ConfigModel):
-    """LangSmith tracing and local audit settings with env-only secrets."""
+    """Focused reward/training audit settings with env-only secrets."""
 
     langsmith_tracing: StrictBool = False
     langsmith_project: _NON_EMPTY = "rlff"
     langsmith_api_key_env: _NON_EMPTY = "LANGSMITH_API_KEY"
+    # Compact rows for every parsed completion and trajectory reward.
     audit_jsonl: Path | None = None
+    # Full request/response rows for a stable subset of trajectories.
+    reward_detail_jsonl: Path | None = None
+    reward_detail_sample_rate: _PROBABILITY = 0.015625
+    # Full request/response history for every reward operation that exhausts retries.
+    reward_failure_jsonl: Path | None = None
+    # AReaL-native actor loss and clip ratio only; no loss is recomputed.
+    training_metrics_jsonl: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -528,6 +562,7 @@ __all__ = [
     "RLFFConfig",
     "RewardConfig",
     "RewardScopeConfig",
+    "RewardWeightScheduleConfig",
     "RoleGRPOConfig",
     "RolloutConfig",
     "RuntimeSecrets",

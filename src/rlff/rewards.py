@@ -52,6 +52,12 @@ REWARD_REQUEST_SCHEMA_VERSION: Final = "rlff.reward.request.v2"
 REWARD_RESPONSE_SCHEMA_VERSION: Final = "rlff.reward.response.v2"
 COMPLETION_REWARD_PROMPT_FILENAME: Final = "completion_reward_system_v2.txt"
 TRAJECTORY_REWARD_PROMPT_FILENAME: Final = "trajectory_reward_system.txt"
+REPAIR_REWARD_PROMPT_FILENAME: Final = "error_system.txt"
+DEFAULT_REPAIR_PROMPT: Final = (
+    "Current result:\n{json_result}\nError:\n{error_message}\n"
+    "Character: {character}\nIndexed replies:\n{utters}\n"
+    "Return only the repaired JSON result."
+)
 PLACEHOLDER_MARKER: Final = "[PLACEHOLDER]"
 DEEPSEEK_V4_FLASH_PROVIDER: Final = "deepseek-v4-flash"
 QWEN3_7_FLASH_PROVIDER: Final = "qwen3.7-flash"
@@ -285,6 +291,55 @@ def _parse_model_response(
         raise RewardResponseError(f"invalid reward response: {exc}") from exc
 
 
+def _reward_response_debug(raw_response: str) -> dict[str, Any]:
+    """Extract final content and model reasoning from supported HTTP envelopes."""
+
+    try:
+        outer = json.loads(raw_response)
+    except json.JSONDecodeError:
+        return {"content": raw_response, "thinking": None, "usage": {}, "finish_reason": None}
+    if not isinstance(outer, Mapping):
+        return {"content": raw_response, "thinking": None, "usage": {}, "finish_reason": None}
+
+    usage = outer.get("usage")
+    usage_data = dict(usage) if isinstance(usage, Mapping) else {}
+    choices = outer.get("choices")
+    if not isinstance(choices, list):
+        output = outer.get("output")
+        choices = output.get("choices") if isinstance(output, Mapping) else None
+
+    message: Mapping[str, Any] = {}
+    finish_reason: Any = None
+    if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
+        candidate = choices[0].get("message")
+        if isinstance(candidate, Mapping):
+            message = candidate
+        finish_reason = choices[0].get("finish_reason")
+
+    content = message.get("content")
+    if isinstance(content, list):
+        parts = [
+            str(part["text"])
+            for part in content
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str)
+        ]
+        content = "".join(parts) if parts else content
+    if not message:
+        content = raw_response
+
+    thinking: Any = None
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        if message.get(key) is not None:
+            thinking = message[key]
+            break
+    return {
+        "content": content,
+        "thinking": thinking,
+        "usage": usage_data,
+        "finish_reason": finish_reason,
+    }
+
+
 def parse_completion_reward_response(
     raw: str | bytes | Mapping[str, Any],
     *,
@@ -512,6 +567,12 @@ def _history_text(turns: Sequence[Mapping[str, Any]]) -> str:
     )
 
 
+def _indexed_utters(texts: Sequence[str]) -> list[dict[str, Any]]:
+    """Label target-role replies so a repair request cannot invent coverage."""
+
+    return [{"index": index, "content": text} for index, text in enumerate(texts)]
+
+
 def _merged_tasks(shared_tasks: Sequence[Any], private_tasks: Sequence[Any]) -> tuple[str, ...]:
     """Merge shared and target-private tasks once, preserving their source order."""
 
@@ -550,6 +611,7 @@ def build_completion_reward_payload(
             "plot": episode.plot,
         },
         "completion_texts": [completion.text for completion in completions],
+        "utters": _indexed_utters([completion.text for completion in completions]),
         "input": {
             "utterances": _history_text(_full_trajectory_history(episode, trajectory)),
         },
@@ -704,6 +766,9 @@ def build_proxy_completion_reward_payload(
         "completion_texts": [
             str(_proxy_field(item, "text", "")) for item in target_completions
         ],
+        "utters": _indexed_utters(
+            [str(_proxy_field(item, "text", "")) for item in target_completions]
+        ),
         "input": {
             "utterances": _history_text(history),
         },
@@ -1159,8 +1224,10 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         model: str = DEEPSEEK_V4_FLASH_PROVIDER,
         completion_prompt: str | None = None,
         trajectory_prompt: str | None = None,
+        repair_prompt: str | None = None,
         completion_prompt_path: str | Path | None = None,
         trajectory_prompt_path: str | Path | None = None,
+        repair_prompt_path: str | Path | None = None,
         trajectory_reward_model: str | None = None,
         completion_timeout_seconds: float = 120.0,
         trajectory_timeout_seconds: float | None = None,
@@ -1181,6 +1248,10 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         config: Any = None,
         development: bool = False,
         allow_placeholder_prompt: bool | None = None,
+        audit_jsonl: str | Path | None = None,
+        detail_jsonl: str | Path | None = None,
+        detail_sample_rate: float = 0.0,
+        failure_jsonl: str | Path | None = None,
     ) -> None:
         if allow_placeholder_prompt is not None:
             development = development or allow_placeholder_prompt
@@ -1203,6 +1274,11 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                 provider=cast(Any, self.config_provider_name),
                 development=development,
             )
+            repair_prompt = load_reward_prompt(
+                config.repair_prompt_path,
+                provider=cast(Any, self.config_provider_name),
+                development=development,
+            )
             completion_timeout_seconds = float(completion_scope.timeout_seconds)
             trajectory_timeout_seconds = float(trajectory_scope.timeout_seconds)
             completion_retries = int(completion_scope.retries)
@@ -1220,7 +1296,7 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         else:
             self._trajectory_model = trajectory_reward_model or model
 
-        if completion_prompt is None or trajectory_prompt is None:
+        if completion_prompt is None or trajectory_prompt is None or repair_prompt is None:
             if completion_prompt is None and completion_prompt_path is not None:
                 completion_prompt = load_reward_prompt(
                     completion_prompt_path,
@@ -1233,10 +1309,18 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                     provider=cast(Any, self.config_provider_name),
                     development=development,
                 )
-        if completion_prompt is None or trajectory_prompt is None:
+            if repair_prompt is None and repair_prompt_path is not None:
+                repair_prompt = load_reward_prompt(
+                    repair_prompt_path,
+                    provider=cast(Any, self.config_provider_name),
+                    development=development,
+                )
+        if repair_prompt is None and config is None:
+            repair_prompt = DEFAULT_REPAIR_PROMPT
+        if completion_prompt is None or trajectory_prompt is None or repair_prompt is None:
             raise RewardPromptError(
                 f"{self.provider_name} provider requires non-empty completion_prompt "
-                "and trajectory_prompt"
+                "trajectory_prompt, and repair_prompt"
             )
         self._completion_prompt = _validate_prompt_text(
             completion_prompt,
@@ -1247,6 +1331,12 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         self._trajectory_prompt = _validate_prompt_text(
             trajectory_prompt,
             source="trajectory_prompt",
+            provider=cast(Any, self.config_provider_name),
+            development=development,
+        )
+        self._repair_prompt = _validate_prompt_text(
+            repair_prompt,
+            source="repair_prompt",
             provider=cast(Any, self.config_provider_name),
             development=development,
         )
@@ -1262,6 +1352,16 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             self._trajectory_prompt,
             {"character": "character", "plot": "plot", "tasks": "[]"},
             required=("character", "plot", "tasks"),
+        )
+        render_reward_prompt(
+            self._repair_prompt,
+            {
+                "json_result": "{}",
+                "error_message": "error",
+                "character": "character",
+                "utters": "[]",
+            },
+            required=("json_result", "error_message", "character", "utters"),
         )
         api_key = api_key or os.getenv(self.default_api_key_env)
         if transport is None and not api_key:
@@ -1337,6 +1437,14 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                 project=langsmith_project,
                 api_key=langsmith_api_key,
             )
+        from .observability import RewardAuditWriter
+
+        self._audit_writer = RewardAuditWriter(
+            audit_jsonl=audit_jsonl,
+            detail_jsonl=detail_jsonl,
+            detail_sample_rate=detail_sample_rate,
+            failure_jsonl=failure_jsonl,
+        )
 
     @classmethod
     def from_config(
@@ -1527,7 +1635,7 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             raise RewardResponseError(
                 "proxy completion_texts must exactly cover completion_ids"
             )
-        _raw, parsed, error = await self._request_reward(
+        raw, parsed, error = await self._request_reward(
             scope="completion_local",
             prompt=self._completion_prompt,
             model=self._model,
@@ -1538,10 +1646,27 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             identifiers={str(key): str(value) for key, value in identifiers.items()},
         )
         if parsed is None:
+            self._write_proxy_reward_audit(
+                scope="completion_local",
+                payload=payload,
+                raw_response=raw,
+                parsed=None,
+                rewards=None,
+                error=error,
+            )
             raise RewardResponseError(error or "proxy completion reward response was invalid")
+        completion_parsed = cast(CompletionRewardResponse, parsed)
         rewards = completion_response_rewards(
-            cast(CompletionRewardResponse, parsed),
+            completion_parsed,
             reply_texts=completion_texts,
+        )
+        self._write_proxy_reward_audit(
+            scope="completion_local",
+            payload=payload,
+            raw_response=raw,
+            parsed=completion_parsed,
+            rewards=rewards,
+            error=None,
         )
         return dict(zip(completion_ids, rewards, strict=True))
 
@@ -1556,8 +1681,17 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             raise RewardResponseError("proxy trajectory payload tasks must be a sequence")
         tasks = tuple(str(task) for task in tasks_value)
         if not tasks:
+            self._write_proxy_reward_audit(
+                scope="trajectory_role",
+                payload=payload,
+                raw_response=None,
+                parsed=None,
+                rewards=(0.0,),
+                error=None,
+                status="skipped",
+            )
             return 0.0
-        _raw, parsed, error = await self._request_reward(
+        raw, parsed, error = await self._request_reward(
             scope="trajectory_role",
             prompt=self._trajectory_prompt,
             model=self._trajectory_model,
@@ -1568,8 +1702,100 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             identifiers={str(key): str(value) for key, value in identifiers.items()},
         )
         if parsed is None:
+            self._write_proxy_reward_audit(
+                scope="trajectory_role",
+                payload=payload,
+                raw_response=raw,
+                parsed=None,
+                rewards=None,
+                error=error,
+            )
             raise RewardResponseError(error or "proxy trajectory reward response was invalid")
-        return trajectory_response_reward(cast(TrajectoryRewardResponse, parsed))
+        trajectory_parsed = cast(TrajectoryRewardResponse, parsed)
+        reward = trajectory_response_reward(trajectory_parsed)
+        self._write_proxy_reward_audit(
+            scope="trajectory_role",
+            payload=payload,
+            raw_response=raw,
+            parsed=trajectory_parsed,
+            rewards=(reward,),
+            error=None,
+        )
+        return reward
+
+    def _write_proxy_reward_audit(
+        self,
+        *,
+        scope: Literal["completion_local", "trajectory_role"],
+        payload: Mapping[str, Any],
+        raw_response: str | None,
+        parsed: CompletionRewardResponse | TrajectoryRewardResponse | None,
+        rewards: Sequence[float] | None,
+        error: str | None,
+        status: str | None = None,
+    ) -> None:
+        """Record the exact post-parse reward used by the proxy training path."""
+
+        identifiers_value = payload.get("ids", {})
+        identifiers = (
+            {str(key): value for key, value in identifiers_value.items()}
+            if isinstance(identifiers_value, Mapping)
+            else {}
+        )
+        trajectory_id = str(identifiers.get("trajectory_id", ""))
+        resolved_status = status or ("ok" if parsed is not None else "invalid")
+        record: dict[str, Any] = {
+            "provider": self.provider_name,
+            "scope": scope,
+            "status": resolved_status,
+            "ids": identifiers,
+            "model": self._model if scope == "completion_local" else self._trajectory_model,
+        }
+        if error:
+            record["error"] = error
+        if scope == "completion_local" and isinstance(parsed, CompletionRewardResponse):
+            completion_ids = tuple(str(value) for value in identifiers.get("completion_ids", ()))
+            reply_texts_value = payload.get("completion_texts", ())
+            reply_texts = tuple(str(value) for value in reply_texts_value)
+            effective_values = tuple(
+                completion_effective_values(score, text)
+                for score, text in zip(parsed.scores, reply_texts, strict=True)
+            )
+            record["completion_rewards"] = [
+                {
+                    "completion_id": completion_id,
+                    "model_values": list(score.values),
+                    "effective_values": list(values),
+                    "reward": reward,
+                }
+                for completion_id, score, values, reward in zip(
+                    completion_ids,
+                    parsed.scores,
+                    effective_values,
+                    rewards or (),
+                    strict=True,
+                )
+            ]
+        elif scope == "trajectory_role":
+            record["reward"] = float(rewards[0]) if rewards else None
+            record["task_rewards"] = (
+                [item.model_dump(mode="json") for item in parsed.score]
+                if isinstance(parsed, TrajectoryRewardResponse)
+                else []
+            )
+        self._audit_writer.write_reward(record)
+        if raw_response is not None:
+            self._audit_writer.write_detail(
+                trajectory_id=trajectory_id,
+                record={
+                    **record,
+                    "protocol_payload": dict(payload),
+                    "parsed_response": (
+                        parsed.model_dump(mode="json") if parsed is not None else None
+                    ),
+                    "raw_response": raw_response,
+                },
+            )
 
     async def score_trajectory_role(
         self,
@@ -1611,6 +1837,39 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             "response_format": {"type": "json_object"},
             "stream": False,
         }
+
+    def _completion_repair_messages(
+        self,
+        *,
+        payload: Mapping[str, Any],
+        json_result: str,
+        error_message: str,
+    ) -> list[dict[str, str]]:
+        identifiers = payload.get("ids")
+        if not isinstance(identifiers, Mapping):
+            raise RewardResponseError("completion repair payload is missing ids")
+        character = str(identifiers.get("character", "")).strip()
+        utters = payload.get("utters")
+        if not character or not isinstance(utters, Sequence) or isinstance(
+            utters, (str, bytes, bytearray)
+        ):
+            raise RewardResponseError("completion repair payload has invalid indexed utters")
+        rendered = render_reward_prompt(
+            self._repair_prompt,
+            {
+                "json_result": json_result,
+                "error_message": error_message,
+                "character": character,
+                "utters": json.dumps(list(utters), ensure_ascii=False, indent=2),
+            },
+            required=("json_result", "error_message", "character", "utters"),
+        )
+        return _json_payload(
+            [
+                {"role": "system", "content": rendered},
+                {"role": "user", "content": "请仅返回修复后的 JSON 结果。"},
+            ]
+        )
 
     async def _request_reward(
         self,
@@ -1702,6 +1961,7 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             headers["Authorization"] = f"Bearer {self._api_key}"
         raw_response: str | None = None
         last_error: str | None = None
+        attempt_records: list[dict[str, Any]] = []
         run_id: str | None = None
         trace_finished = False
         if self._tracer is not None:
@@ -1715,6 +1975,11 @@ class DeepSeekRewardProvider(_RewardProviderBase):
         try:
             async with semaphore:
                 for attempt in range(retries + 1):
+                    repair_result: str | None = None
+                    attempt_record: dict[str, Any] = {
+                        "attempt": attempt + 1,
+                        "request": request_payload,
+                    }
                     try:
                         result = await asyncio.wait_for(
                             _call_transport(
@@ -1728,12 +1993,16 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                         )
                         response = _response_from_transport(result)
                         raw_response = _redact(response.text, [self._api_key])
+                        attempt_record["status_code"] = response.status_code
+                        attempt_record["raw_response"] = raw_response
+                        attempt_record.update(_reward_response_debug(raw_response))
                         if not 200 <= response.status_code < 300:
                             raise RewardTransportError(
                                 f"{self.provider_name} HTTP status {response.status_code}: "
                                 f"{raw_response}"
                             )
                         model_text = self._extract_model_text(raw_response)
+                        repair_result = model_text
                         if scope == "completion_local":
                             completion_parsed = parse_completion_reward_response(
                                 model_text,
@@ -1783,18 +2052,47 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                             f"{type(exc).__name__}: {exc}",
                             [self._api_key],
                         )
+                    attempt_record["error"] = last_error
+                    attempt_records.append(attempt_record)
                     if attempt < retries:
+                        if scope == "completion_local" and repair_result is not None:
+                            repair_messages = self._completion_repair_messages(
+                                payload=payload,
+                                json_result=repair_result,
+                                error_message=last_error or "invalid completion reward response",
+                            )
+                            request_payload = self._build_request_payload(
+                                model=model,
+                                messages=repair_messages,
+                                temperature=self._completion_temperature,
+                                reasoning_effort=self._completion_reasoning_effort,
+                                max_tokens=self._completion_max_tokens,
+                            )
                         await asyncio.sleep(0)
         finally:
             if self._tracer is not None and run_id is not None and not trace_finished:
                 self._trace_finish(run_id, error=last_error)
+        terminal_error = (
+            f"{self.provider_name} {scope} reward exhausted {retries + 1} attempts: "
+            f"{last_error or 'unknown reward error'}"
+        )
+        payload_ids = payload.get("ids")
+        self._audit_writer.write_failure(
+            {
+                "provider": self.provider_name,
+                "scope": scope,
+                "status": "invalid",
+                "model": model,
+                "ids": dict(payload_ids) if isinstance(payload_ids, Mapping) else dict(identifiers),
+                "error": terminal_error,
+                "protocol_payload": dict(payload),
+                "attempts": attempt_records,
+            }
+        )
         return (
             raw_response,
             None,
-            (
-                f"{self.provider_name} {scope} reward exhausted {retries + 1} attempts: "
-                f"{last_error or 'unknown reward error'}"
-            ),
+            terminal_error,
         )
 
     @staticmethod

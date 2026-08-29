@@ -10,15 +10,84 @@ reconstructed here and arrive only from AReaL's proxy export.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
+import logging
 import math
 import os
+import random
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
 from .rollout import rounds_for_character_count
+
+logger = logging.getLogger(__name__)
+
+
+def _group_character_order(characters: Sequence[str], group_key: str) -> tuple[str, ...]:
+    """Return one reproducible shuffled order shared by a native GRPO group."""
+
+    ordered = list(characters)
+    if len(ordered) < 2:
+        return tuple(ordered)
+    seed = int.from_bytes(
+        hashlib.sha256(f"rlff-character-order:{group_key}".encode()).digest()[:8],
+        "big",
+    )
+    random.Random(seed).shuffle(ordered)
+    return tuple(ordered)
+
+
+def reward_weights_for_step(
+    step: int,
+    *,
+    completion_start_weight: float,
+    global_start_weight: float,
+    schedule_start_step: int | None = None,
+    schedule_end_step: int | None = None,
+    completion_end_weight: float | None = None,
+    global_end_weight: float | None = None,
+) -> tuple[float, float]:
+    """Return constant or linearly interpolated reward weights for one update step."""
+
+    if type(step) is not int or step < 0:
+        raise ValueError("reward schedule step must be a non-negative integer")
+    start_weights = (
+        _finite(completion_start_weight, field="completion_start_weight"),
+        _finite(global_start_weight, field="global_start_weight"),
+    )
+    schedule = (
+        schedule_start_step,
+        schedule_end_step,
+        completion_end_weight,
+        global_end_weight,
+    )
+    if all(value is None for value in schedule):
+        return start_weights
+    if any(value is None for value in schedule):
+        raise ValueError("reward weight schedule fields must be supplied together")
+    assert schedule_start_step is not None
+    assert schedule_end_step is not None
+    assert completion_end_weight is not None
+    assert global_end_weight is not None
+    if schedule_start_step < 0 or schedule_end_step <= schedule_start_step:
+        raise ValueError("reward schedule requires 0 <= start_step < end_step")
+    end_weights = (
+        _finite(completion_end_weight, field="completion_end_weight"),
+        _finite(global_end_weight, field="global_end_weight"),
+    )
+    if any(value < 0 for value in (*start_weights, *end_weights)):
+        raise ValueError("reward weights must be non-negative")
+    if step <= schedule_start_step:
+        return start_weights
+    if step >= schedule_end_step:
+        return end_weights
+    progress = (step - schedule_start_step) / (schedule_end_step - schedule_start_step)
+    completion_weight = start_weights[0] + (end_weights[0] - start_weights[0]) * progress
+    global_weight = start_weights[1] + (end_weights[1] - start_weights[1]) * progress
+    return completion_weight, global_weight
 
 
 class ProxyGroupError(RuntimeError):
@@ -281,6 +350,7 @@ def normalize_proxy_role_advantages(
 class _GroupState:
     expected: int
     future: asyncio.Future[dict[str, float]]
+    reward_step: int
     trajectories: dict[int, ProxyTrajectoryView] = field(default_factory=dict)
     next_slot: int = 0
     finished_runs: int = 0
@@ -308,6 +378,12 @@ class RLFFGroupAwareAgent:
         rollout_request_timeout_seconds: float = 120.0,
         completion_weight: float = 0.6,
         global_weight: float = 0.4,
+        reward_schedule_start_step: int | None = None,
+        reward_schedule_end_step: int | None = None,
+        reward_schedule_completion_end_weight: float | None = None,
+        reward_schedule_global_end_weight: float | None = None,
+        reward_schedule_initial_step: int = 0,
+        reward_schedule_use_proxy_version: bool = False,
         min_group_size: int = 2,
         reward_std_epsilon: float = 1e-8,
         system_prompt: str = "",
@@ -320,6 +396,7 @@ class RLFFGroupAwareAgent:
         ),
         completion_prompt_path: str | None = None,
         trajectory_prompt_path: str | None = None,
+        reward_repair_prompt_path: str | None = None,
         reward_model: str = "qwen3.7-flash",
         trajectory_reward_model: str | None = None,
         completion_reward_timeout_seconds: float = 120.0,
@@ -337,6 +414,10 @@ class RLFFGroupAwareAgent:
         langsmith_tracing: bool = False,
         langsmith_project: str = "rlff",
         langsmith_api_key_env: str = "LANGSMITH_API_KEY",
+        reward_audit_jsonl: str | None = None,
+        reward_detail_jsonl: str | None = None,
+        reward_detail_sample_rate: float = 0.0,
+        reward_failure_jsonl: str | None = None,
         trajectory_runner: ProxyTrajectoryRunner | None = None,
     ) -> None:
         if type(group_size) is not int or group_size <= 0:
@@ -360,6 +441,21 @@ class RLFFGroupAwareAgent:
         self.rollout_request_timeout_seconds = rollout_request_timeout_seconds
         self.completion_weight = completion_weight
         self.global_weight = global_weight
+        self._reward_schedule_start_step = reward_schedule_start_step
+        self._reward_schedule_end_step = reward_schedule_end_step
+        self._reward_schedule_completion_end_weight = reward_schedule_completion_end_weight
+        self._reward_schedule_global_end_weight = reward_schedule_global_end_weight
+        self._reward_schedule_step = reward_schedule_initial_step
+        self._reward_schedule_use_proxy_version = reward_schedule_use_proxy_version
+        reward_weights_for_step(
+            reward_schedule_initial_step,
+            completion_start_weight=completion_weight,
+            global_start_weight=global_weight,
+            schedule_start_step=reward_schedule_start_step,
+            schedule_end_step=reward_schedule_end_step,
+            completion_end_weight=reward_schedule_completion_end_weight,
+            global_end_weight=reward_schedule_global_end_weight,
+        )
         self.min_group_size = min_group_size
         self.reward_std_epsilon = reward_std_epsilon
         self.system_prompt = system_prompt
@@ -369,6 +465,7 @@ class RLFFGroupAwareAgent:
         self._reward_base_url = reward_base_url
         self._completion_prompt_path = completion_prompt_path
         self._trajectory_prompt_path = trajectory_prompt_path
+        self._reward_repair_prompt_path = reward_repair_prompt_path
         self._reward_model = reward_model
         self._trajectory_reward_model = trajectory_reward_model
         self._completion_reward_timeout_seconds = completion_reward_timeout_seconds
@@ -386,9 +483,14 @@ class RLFFGroupAwareAgent:
         self._langsmith_tracing = langsmith_tracing
         self._langsmith_project = langsmith_project
         self._langsmith_api_key_env = langsmith_api_key_env
+        self._reward_audit_jsonl = reward_audit_jsonl
+        self._reward_detail_jsonl = reward_detail_jsonl
+        self._reward_detail_sample_rate = reward_detail_sample_rate
+        self._reward_failure_jsonl = reward_failure_jsonl
         self._trajectory_runner = trajectory_runner
         self._states: dict[str, _GroupState] = {}
         self._states_lock = asyncio.Lock()
+        self._reward_schedule_lock = asyncio.Lock()
 
     async def run(
         self,
@@ -401,7 +503,8 @@ class RLFFGroupAwareAgent:
         """Run one trajectory and wait for all group peers to be scored."""
 
         key = self._group_key(data)
-        state = await self._get_state(key)
+        reward_step = await self._resolve_reward_step(base_url, http_client)
+        state = await self._get_state(key, reward_step)
         async with self._states_lock:
             if state.next_slot >= state.expected:
                 error = ProxyGroupError(f"too many proxy runs for group {key!r}")
@@ -513,16 +616,41 @@ class RLFFGroupAwareAgent:
             task_id = None
         return f"{task_id if task_id is not None else 'local'}:{self._group_id(data)}"
 
-    async def _get_state(self, key: str) -> _GroupState:
+    async def _resolve_reward_step(self, base_url: str, http_client: Any) -> int:
+        if not self._reward_schedule_use_proxy_version:
+            return self._reward_schedule_step
+        try:
+            response = await http_client.post(
+                f"{base_url.rstrip('/')}/call",
+                json={"method": "get_version", "args": [], "kwargs": {}},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            version = payload.get("result") if isinstance(payload, Mapping) else None
+        except Exception as exc:
+            raise ProxyGroupError("cannot read AReaL rollout model version") from exc
+        if type(version) is not int or version < 0:
+            raise ProxyGroupError("AReaL rollout model version must be a non-negative integer")
+        return version
+
+    async def _get_state(self, key: str, reward_step: int) -> _GroupState:
         async with self._states_lock:
             state = self._states.get(key)
             if state is None:
                 future: asyncio.Future[dict[str, float]] = (
                     asyncio.get_running_loop().create_future()
                 )
-                state = _GroupState(expected=self.group_size, future=future)
+                state = _GroupState(
+                    expected=self.group_size,
+                    future=future,
+                    reward_step=reward_step,
+                )
                 future.add_done_callback(self._consume_future_exception)
                 self._states[key] = state
+            elif state.reward_step != reward_step:
+                error = ProxyGroupError("one proxy group observed multiple model versions")
+                self._fail_state(state, error)
+                raise error
             return state
 
     @staticmethod
@@ -544,7 +672,21 @@ class RLFFGroupAwareAgent:
             state.future.set_exception(error)
 
     async def _score_group(self, state: _GroupState) -> None:
+        async with self._reward_schedule_lock:
+            await self._score_group_at_step(state)
+
+    async def _score_group_at_step(self, state: _GroupState) -> None:
         try:
+            reward_step = state.reward_step
+            completion_weight, global_weight = reward_weights_for_step(
+                reward_step,
+                completion_start_weight=self.completion_weight,
+                global_start_weight=self.global_weight,
+                schedule_start_step=self._reward_schedule_start_step,
+                schedule_end_step=self._reward_schedule_end_step,
+                completion_end_weight=self._reward_schedule_completion_end_weight,
+                global_end_weight=self._reward_schedule_global_end_weight,
+            )
             trajectories = tuple(state.trajectories[index] for index in range(state.expected))
             provider = self._get_reward_provider()
             completion_payloads = [
@@ -593,12 +735,20 @@ class RLFFGroupAwareAgent:
                 trajectories,
                 completion_rewards,
                 trajectory_role_rewards,
-                completion_weight=self.completion_weight,
-                global_weight=self.global_weight,
+                completion_weight=completion_weight,
+                global_weight=global_weight,
                 min_group_size=self.min_group_size,
                 reward_std_epsilon=self.reward_std_epsilon,
             )
             if not state.future.done():
+                logger.info(
+                    "RLFF reward weights global_step=%d completion=%.6f trajectory=%.6f",
+                    reward_step,
+                    completion_weight,
+                    global_weight,
+                )
+                if not self._reward_schedule_use_proxy_version:
+                    self._reward_schedule_step += 1
                 state.future.set_result(result)
         except BaseException as exc:
             self._fail_state(
@@ -648,6 +798,7 @@ class RLFFGroupAwareAgent:
                 trajectory_reward_model=self._trajectory_reward_model,
                 completion_prompt_path=self._completion_prompt_path,
                 trajectory_prompt_path=self._trajectory_prompt_path,
+                repair_prompt_path=self._reward_repair_prompt_path,
                 completion_timeout_seconds=self._completion_reward_timeout_seconds,
                 trajectory_timeout_seconds=self._trajectory_reward_timeout_seconds,
                 completion_retries=self._completion_reward_retries,
@@ -662,6 +813,10 @@ class RLFFGroupAwareAgent:
                 trajectory_max_tokens=self._trajectory_reward_max_tokens,
                 langsmith_project=self._langsmith_project,
                 langsmith_api_key=langsmith_api_key,
+                audit_jsonl=self._reward_audit_jsonl,
+                detail_jsonl=self._reward_detail_jsonl,
+                detail_sample_rate=self._reward_detail_sample_rate,
+                failure_jsonl=self._reward_failure_jsonl,
             ),
         )
         return self._reward_provider
@@ -743,7 +898,10 @@ class RLFFGroupAwareAgent:
         except Exception as exc:
             raise ProxyGroupError("proxy episode is not a valid EpisodeRecord") from exc
         episode_id = str(episode.get("episode_id") or group_id)
-        characters = tuple(character.name for character in episode_record.characters)
+        characters = _group_character_order(
+            tuple(character.name for character in episode_record.characters),
+            self._group_key(data),
+        )
         if not characters:
             raise ProxyGroupError("episode must declare ordered characters")
         render = self._render_spec(data, PromptRenderSpec, DEFAULT_PROMPT_TEMPLATE)
@@ -885,4 +1043,5 @@ __all__ = [
     "RLFFGroupAwareAgent",
     "decode_proxy_episode_payload",
     "normalize_proxy_role_advantages",
+    "reward_weights_for_step",
 ]

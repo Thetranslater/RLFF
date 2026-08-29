@@ -20,9 +20,24 @@ from rlff.proxy import (
     ProxyGroupError,
     ProxyTrajectoryView,
     RLFFGroupAwareAgent,
+    _group_character_order,
     decode_proxy_episode_payload,
     normalize_proxy_role_advantages,
+    reward_weights_for_step,
 )
+
+
+def test_character_order_is_shuffled_once_per_group_key() -> None:
+    characters = ("Alice", "Bob", "Carol")
+    first = _group_character_order(characters, "task-1:group-1")
+    assert first == _group_character_order(characters, "task-1:group-1")
+    assert set(first) == set(characters)
+    assert _group_character_order(("Alice",), "task-1:group-1") == ("Alice",)
+    observed = {
+        _group_character_order(characters, f"task-{index}:group-1")
+        for index in range(12)
+    }
+    assert len(observed) > 1
 
 
 def _write_runtime_files(tmp_path: Path) -> tuple[RLFFConfig, Path]:
@@ -105,6 +120,14 @@ train_dataset:
         "rewards": {
             "completion": {"prompt_path": str(tmp_path / "completion.txt")},
             "global_reward": {"prompt_path": str(tmp_path / "global.txt")},
+            "completion_weight": 0.7,
+            "global_weight": 0.3,
+            "weight_schedule": {
+                "start_step": 150,
+                "end_step": 250,
+                "completion_end_weight": 0.4,
+                "global_end_weight": 0.6,
+            },
         },
         "lora": {
             "base_model": "base-model",
@@ -140,8 +163,61 @@ def test_agent_workflow_kwargs_include_reward_sampling_settings(tmp_path: Path) 
     assert kwargs["trajectory_reward_reasoning_effort"] == "medium"
     assert kwargs["completion_reward_max_tokens"] == 16384
     assert kwargs["trajectory_reward_max_tokens"] == 16384
+    assert kwargs["completion_weight"] == 0.7
+    assert kwargs["global_weight"] == 0.3
+    assert kwargs["reward_schedule_start_step"] == 150
+    assert kwargs["reward_schedule_end_step"] == 250
+    assert kwargs["reward_schedule_completion_end_weight"] == 0.4
+    assert kwargs["reward_schedule_global_end_weight"] == 0.6
+    assert kwargs["reward_schedule_use_proxy_version"] is False
     assert kwargs["frequency_penalty"] == 0.0
     assert kwargs["rollout_request_timeout_seconds"] == 120.0
+
+
+@pytest.mark.parametrize(
+    "step, expected",
+    [
+        (0, (0.7, 0.3)),
+        (149, (0.7, 0.3)),
+        (150, (0.7, 0.3)),
+        (200, (0.55, 0.45)),
+        (250, (0.4, 0.6)),
+        (399, (0.4, 0.6)),
+    ],
+)
+def test_reward_weight_schedule_boundaries(
+    step: int,
+    expected: tuple[float, float],
+) -> None:
+    actual = reward_weights_for_step(
+        step,
+        completion_start_weight=0.7,
+        global_start_weight=0.3,
+        schedule_start_step=150,
+        schedule_end_step=250,
+        completion_end_weight=0.4,
+        global_end_weight=0.6,
+    )
+    assert actual == pytest.approx(expected)
+
+
+def test_reward_schedule_reads_areal_rollout_model_version() -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"status": "success", "result": 173}
+
+    class Client:
+        async def post(self, url: str, **kwargs: object) -> Response:
+            assert url == "http://proxy/call"
+            assert kwargs["json"] == {"method": "get_version", "args": [], "kwargs": {}}
+            return Response()
+
+    agent = RLFFGroupAwareAgent(reward_schedule_use_proxy_version=True)
+    step = asyncio.run(agent._resolve_reward_step("http://proxy", Client()))
+    assert step == 173
 
 
 def test_runtime_plan_rejects_nondefault_proxy_lora_name(
@@ -500,6 +576,11 @@ def test_group_agent_barrier_returns_only_own_session_rewards() -> None:
         trajectory_runner=run_trajectory,
         completion_weight=0.5,
         global_weight=0.5,
+        reward_schedule_start_step=150,
+        reward_schedule_end_step=250,
+        reward_schedule_completion_end_weight=0.4,
+        reward_schedule_global_end_weight=0.6,
+        reward_schedule_initial_step=149,
         min_group_size=4,
     )
 
@@ -521,6 +602,7 @@ def test_group_agent_barrier_returns_only_own_session_rewards() -> None:
     assert len(set().union(*(set(result) for result in results))) == 8
     assert len(provider.completion_calls) == 8
     assert len(provider.trajectory_calls) == 8
+    assert agent._reward_schedule_step == 150
 
 
 def test_group_agent_barrier_failure_fails_every_run() -> None:
@@ -582,6 +664,7 @@ def test_group_agent_barrier_failure_fails_every_run() -> None:
 
     results = asyncio.run(execute())
     assert all(isinstance(result, ProxyGroupError) for result in results)
+    assert agent._reward_schedule_step == 0
 
 
 def test_public_generate_trajectory_uses_training_runner_without_reward_barrier() -> None:

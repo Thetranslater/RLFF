@@ -653,6 +653,7 @@ def run_cloud_audit(
     from .proxy import RLFFGroupAwareAgent
 
     dataset = runtime.build_areal_training_dataset(config)
+    selected_indices: tuple[int, ...]
     if episode_index is not None:
         if episode_index < 0 or episode_index >= len(dataset):
             raise IndexError(

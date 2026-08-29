@@ -197,25 +197,14 @@ async def test_real_agent_openai_transport_accumulates_round_robin_history(
 
     assert results[0]["status"] == "ok"
     trajectory = results[0]["trajectory"]
-    assert [turn["character"] for turn in trajectory["turns"]] == [
-        "Alice",
-        "Bob",
-        "Alice",
-        "Bob",
-        "Alice",
-        "Bob",
-        "Alice",
-        "Bob",
-        "Alice",
-        "Bob",
-        "Alice",
-        "Bob",
-        "Alice",
-        "Bob",
-    ]
+    character_order = [turn["character"] for turn in trajectory["turns"]]
+    first_round = character_order[:2]
+    assert set(first_round) == {"Alice", "Bob"}
+    assert character_order == first_round * 7
     assert len(requests) == 14
     assert all(request["model"] == "base:rlff-sft" for request in requests)
     assert any(
-        message["role"] == "user" and "Alice:reply-Alice-0" in message["content"]
+        message["role"] == "user"
+        and f"{first_round[0]}:reply-Alice-0" in message["content"]
         for message in requests[1]["messages"]
     )

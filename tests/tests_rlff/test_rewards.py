@@ -111,14 +111,20 @@ def trajectory_model_response(tasks: list[str], values: list[int]) -> str:
     return json.dumps({"choices": [{"message": {"content": json.dumps({"score": score})}}]})
 
 
-def dashscope_model_response(content: dict[str, object]) -> str:
+def dashscope_model_response(
+    content: dict[str, object], *, thinking: str | None = None
+) -> str:
+    message: dict[str, object] = {"role": "assistant", "content": json.dumps(content)}
+    if thinking is not None:
+        message["reasoning_content"] = thinking
     return json.dumps(
         {
             "output": {
                 "choices": [
-                    {"message": {"role": "assistant", "content": json.dumps(content)}}
+                    {"message": message, "finish_reason": "stop"}
                 ]
-            }
+            },
+            "usage": {"input_tokens": 10, "output_tokens": 5},
         }
     )
 
@@ -298,6 +304,10 @@ async def test_deepseek_invalid_json_retries_then_returns_invalid() -> None:
     assert result.reward is None
     assert result.error and "exhausted" in result.error
     assert result.raw_response is not None
+    repair_system = transport.calls[1]["payload"]["messages"][0]["content"]
+    assert "not-json" in repair_system
+    assert '"index": 0' in repair_system
+    assert "invalid reward response" in repair_system
 
 
 @pytest.mark.asyncio
@@ -407,6 +417,81 @@ async def test_qwen_uses_native_dashscope_messages_and_response_envelope() -> No
         "stream": False,
     }
     assert transport.calls[0]["headers"]["Authorization"] == "Bearer dashscope-key"
+
+
+@pytest.mark.asyncio
+async def test_qwen_repairs_invalid_completion_coverage_with_indexed_utters() -> None:
+    source = episode()
+    sample = trajectory(source)
+    transport = FakeTransport(
+        [
+            dashscope_model_response(
+                {"scores": [{"values": [4, 4, 4, 4]}, {"values": [2, 2, 2, 2]}]}
+            ),
+            dashscope_model_response({"scores": [{"values": [5, 5, 5, 5]}]}),
+        ]
+    )
+    provider = QwenDashScopeRewardProvider(
+        api_key="dashscope-key",
+        completion_prompt=COMPLETION_PROMPT,
+        trajectory_prompt=TRAJECTORY_PROMPT,
+        completion_retries=2,
+        transport=transport,
+    )
+
+    result = await provider.score_completion(source, sample, sample.completions[0])
+
+    assert result.status is RewardStatus.VALID
+    assert len(transport.calls) == 2
+    repair_system = transport.calls[1]["payload"]["input"]["messages"][0]["content"][0][
+        "text"
+    ]
+    assert "expected 1, received 2" in repair_system
+    assert '"index": 0' in repair_system
+
+
+@pytest.mark.asyncio
+async def test_qwen_terminal_failure_logs_every_attempt_thinking_and_reply(
+    tmp_path: Path,
+) -> None:
+    source = episode()
+    sample = trajectory(source)
+    failure_path = tmp_path / "reward-failures.jsonl"
+    transport = FakeTransport(
+        [
+            dashscope_model_response({"scores": {}}, thinking=f"thinking-{index}")
+            for index in range(1, 4)
+        ]
+    )
+    provider = QwenDashScopeRewardProvider(
+        api_key="dashscope-key",
+        completion_prompt=COMPLETION_PROMPT,
+        trajectory_prompt=TRAJECTORY_PROMPT,
+        completion_retries=2,
+        failure_jsonl=failure_path,
+        transport=transport,
+    )
+
+    result = await provider.score_completion(source, sample, sample.completions[0])
+
+    assert result.status is RewardStatus.INVALID
+    records = [
+        json.loads(line) for line in failure_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record["schema_version"] == "rlff.reward-failure.v1"
+    assert record["scope"] == "completion_local"
+    assert [attempt["attempt"] for attempt in record["attempts"]] == [1, 2, 3]
+    assert [attempt["thinking"] for attempt in record["attempts"]] == [
+        "thinking-1",
+        "thinking-2",
+        "thinking-3",
+    ]
+    assert all(json.loads(attempt["content"])["scores"] == {} for attempt in record["attempts"])
+    assert all("error" in attempt for attempt in record["attempts"])
+    assert "request" in record["attempts"][0]
+    assert record["protocol_payload"]["ids"]["episode_id"] == source.episode_id
 
 
 @pytest.mark.asyncio

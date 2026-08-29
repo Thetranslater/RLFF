@@ -39,6 +39,9 @@ from .proxy import RLFFGroupAwareAgent
 AREAL_ADAPTER_ENV: Final[str] = "RLFF_SFT_ADAPTER_PATH"
 """Environment variable propagated to every actor AReaL worker."""
 
+TRAINING_METRICS_ENV: Final[str] = "RLFF_TRAINING_METRICS_JSONL"
+"""Controller-local output path for selected AReaL training statistics."""
+
 AREAL_VERSION_TAG: Final[str] = "areal-v1.0.4"
 
 AREAL_PROXY_LORA_NAME: Final[str] = "default_lora"
@@ -789,6 +792,14 @@ def _build_areal_runtime_classes() -> tuple[Any, Any]:
             )
         inject_adapter_env(config, adapter_path)
         base_trainer.__init__(self, config, *args, **kwargs)
+        metrics_path = os.getenv(TRAINING_METRICS_ENV)
+        if metrics_path:
+            from .observability import TrainingMetricsStatsLoggerProxy
+
+            self.stats_logger = TrainingMetricsStatsLoggerProxy(
+                self.stats_logger,
+                metrics_path,
+            )
 
     def trainer_create_train_engine(self: Any, actor_config: Any, alloc: Any) -> Any:
         if alloc.backend != "fsdp":
@@ -809,6 +820,18 @@ def _build_areal_runtime_classes() -> tuple[Any, Any]:
             self, "_proxy_started", False
         ):
             self._ensure_proxy_started()
+        if getattr(workflow, "requires_rlff_proxy_start", False):
+            workflow_kwargs = dict(kwargs.get("workflow_kwargs") or {})
+            start_step = (
+                self.recover_info.last_step_info.next().global_step
+                if self.recover_info is not None
+                else 0
+            )
+            workflow_kwargs["reward_schedule_initial_step"] = int(start_step)
+            workflow_kwargs["reward_schedule_use_proxy_version"] = (
+                workflow_kwargs.get("reward_schedule_start_step") is not None
+            )
+            kwargs["workflow_kwargs"] = workflow_kwargs
         return base_trainer.train(self, *args, workflow=workflow, **kwargs)
 
     def trainer_save_recover_checkpoint(
@@ -937,6 +960,7 @@ def build_areal_training_dataset(config: RLFFConfig) -> Any:
 def build_agent_workflow_kwargs(config: RLFFConfig) -> dict[str, Any]:
     """Translate RLFF-owned rollout/reward settings to the agent constructor."""
 
+    schedule = config.rewards.weight_schedule
     return {
         "group_size": config.episode_grouping.group_size,
         "max_rounds": config.rollout.max_rounds,
@@ -949,6 +973,15 @@ def build_agent_workflow_kwargs(config: RLFFConfig) -> dict[str, Any]:
         "group_timeout_seconds": config.areal.proxy_group_timeout_seconds,
         "completion_weight": config.rewards.completion_weight,
         "global_weight": config.rewards.global_weight,
+        "reward_schedule_start_step": schedule.start_step if schedule is not None else None,
+        "reward_schedule_end_step": schedule.end_step if schedule is not None else None,
+        "reward_schedule_completion_end_weight": (
+            schedule.completion_end_weight if schedule is not None else None
+        ),
+        "reward_schedule_global_end_weight": (
+            schedule.global_end_weight if schedule is not None else None
+        ),
+        "reward_schedule_use_proxy_version": False,
         "min_group_size": config.grpo.min_group_size,
         "reward_std_epsilon": config.grpo.reward_std_epsilon,
         "reward_provider_name": config.rewards.provider,
@@ -956,6 +989,7 @@ def build_agent_workflow_kwargs(config: RLFFConfig) -> dict[str, Any]:
         "reward_base_url": config.rewards.base_url,
         "completion_prompt_path": str(config.rewards.completion.prompt_path),
         "trajectory_prompt_path": str(config.rewards.global_reward.prompt_path),
+        "reward_repair_prompt_path": str(config.rewards.repair_prompt_path),
         "reward_model": config.rewards.completion.model,
         "trajectory_reward_model": config.rewards.global_reward.model,
         "completion_reward_timeout_seconds": config.rewards.completion.timeout_seconds,
@@ -973,6 +1007,22 @@ def build_agent_workflow_kwargs(config: RLFFConfig) -> dict[str, Any]:
         "langsmith_tracing": config.observability.langsmith_tracing,
         "langsmith_project": config.observability.langsmith_project,
         "langsmith_api_key_env": config.observability.langsmith_api_key_env,
+        "reward_audit_jsonl": (
+            str(config.observability.audit_jsonl.resolve())
+            if config.observability.audit_jsonl is not None
+            else None
+        ),
+        "reward_detail_jsonl": (
+            str(config.observability.reward_detail_jsonl.resolve())
+            if config.observability.reward_detail_jsonl is not None
+            else None
+        ),
+        "reward_detail_sample_rate": config.observability.reward_detail_sample_rate,
+        "reward_failure_jsonl": (
+            str(config.observability.reward_failure_jsonl.resolve())
+            if config.observability.reward_failure_jsonl is not None
+            else None
+        ),
     }
 
 
@@ -990,6 +1040,12 @@ def run_training(
 
     plan = build_runtime_plan(config)
     plan.apply_environment()
+    if config.observability.training_metrics_jsonl is not None:
+        os.environ[TRAINING_METRICS_ENV] = str(
+            config.observability.training_metrics_jsonl.resolve()
+        )
+    else:
+        os.environ.pop(TRAINING_METRICS_ENV, None)
     if workflow is None:
         workflow = RLFFGroupAwareAgent
     if train_dataset is None:
@@ -1052,6 +1108,7 @@ def describe_runtime_plan(config: RLFFConfig) -> dict[str, Any]:
 __all__ = [
     "AREAL_ADAPTER_ENV",
     "AREAL_VERSION_TAG",
+    "TRAINING_METRICS_ENV",
     "AReaLUnavailableError",
     "AReaLYamlConstraints",
     "AdapterMetadata",

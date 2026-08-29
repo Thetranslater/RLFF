@@ -38,8 +38,14 @@ def config_payload(tmp_path: Path) -> dict[str, object]:
         "rewards": {
             "completion": {"prompt_path": str(completion_prompt)},
             "global_reward": {"prompt_path": str(global_prompt)},
-            "completion_weight": 0.6,
-            "global_weight": 0.4,
+            "completion_weight": 0.7,
+            "global_weight": 0.3,
+            "weight_schedule": {
+                "start_step": 150,
+                "end_step": 250,
+                "completion_end_weight": 0.4,
+                "global_end_weight": 0.6,
+            },
         },
         "lora": {
             "base_model": "base-model",
@@ -65,6 +71,11 @@ def test_config_hierarchy_defaults_and_non_secret_snapshot(
     assert config.rewards.global_reward.reasoning_effort == "medium"
     assert config.rewards.completion.max_tokens == 16384
     assert config.rewards.global_reward.max_tokens == 16384
+    assert config.rewards.completion_weight == 0.7
+    assert config.rewards.global_weight == 0.3
+    assert config.rewards.weight_schedule is not None
+    assert config.rewards.weight_schedule.start_step == 150
+    assert config.rewards.weight_schedule.end_step == 250
     assert config.lora.dtype == "bfloat16"
     assert config.areal.use_bf16 is True
     assert config.grpo.normalize_by_role is True
@@ -111,6 +122,20 @@ def test_placeholder_rewards_require_explicit_opt_in(tmp_path: Path) -> None:
         allow_placeholder=True,
     )
     assert allowed.allow_placeholder is True
+
+
+def test_reward_weight_schedule_rejects_invalid_range(tmp_path: Path) -> None:
+    payload = config_payload(tmp_path)
+    rewards = dict(payload["rewards"])  # type: ignore[arg-type]
+    rewards["weight_schedule"] = {
+        "start_step": 250,
+        "end_step": 150,
+        "completion_end_weight": 0.4,
+        "global_end_weight": 0.6,
+    }
+    payload["rewards"] = rewards
+    with pytest.raises(ValidationError, match="end_step"):
+        RLFFConfig.model_validate(payload)
 
 
 @pytest.mark.parametrize(

@@ -27,6 +27,7 @@ sglang:
   timeout_seconds: 120.0
 
 rewards:
+  repair_prompt_path: prompts/error_system.txt
   completion:
     model: qwen3.7-flash
     prompt_path: prompts/completion_reward_system_v2.txt
@@ -45,8 +46,15 @@ rewards:
     temperature: 0.7
     reasoning_effort: medium
     max_tokens: 16384
-  completion_weight: 0.6
-  global_weight: 0.4
+  # Keep completion guidance dominant through step 150, then linearly transfer
+  # weight to trajectory task completion through step 250.
+  completion_weight: 0.7
+  global_weight: 0.3
+  weight_schedule:
+    start_step: 150
+    end_step: 250
+    completion_end_weight: 0.4
+    global_end_weight: 0.6
   provider: qwen_dashscope
   api_key_env: DASHSCOPE_API_KEY
   base_url: https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
@@ -99,3 +107,10 @@ observability:
   langsmith_project: rlff-phase-d
   langsmith_api_key_env: LANGSMITH_API_KEY
   audit_jsonl: outputs/reward-audit.jsonl
+  # 200 episodes * 4 trajectories * 2 epochs = 1600 trajectories; 1/64
+  # yields about 25 stable, concurrency-independent detailed samples.
+  reward_detail_jsonl: outputs/reward-detail-samples.jsonl
+  reward_detail_sample_rate: 0.015625
+  # Unsampled full request/thinking/response history after all retries fail.
+  reward_failure_jsonl: outputs/reward-failures.jsonl
+  training_metrics_jsonl: outputs/training-metrics.jsonl
