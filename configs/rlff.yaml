@@ -23,11 +23,11 @@ sglang:
   top_p: 0.9
   frequency_penalty: 1.2
   max_new_tokens: 256
-  context_length: 6144
+  context_length: 11400
   timeout_seconds: 120.0
 
 rewards:
-  repair_prompt_path: prompts/error_system.txt
+  repair_prompt_path: prompts/error_user.txt
   completion:
     model: qwen3.7-flash
     prompt_path: prompts/completion_reward_system_v2.txt
@@ -36,7 +36,7 @@ rewards:
     concurrency: 4
     temperature: 0.7
     reasoning_effort: medium
-    max_tokens: 16384
+    max_tokens: 18000
   global_reward:
     model: qwen3.7-flash
     prompt_path: prompts/trajectory_reward_system.txt
@@ -45,14 +45,15 @@ rewards:
     concurrency: 4
     temperature: 0.7
     reasoning_effort: medium
-    max_tokens: 16384
-  # Keep completion guidance dominant through step 150, then linearly transfer
-  # weight to trajectory task completion through step 250.
+    max_tokens: 18000
+  # Keep completion guidance dominant through global step 100, then linearly
+  # transfer weight to trajectory task completion. A 200-update epoch ends at
+  # zero-based global step 199, where the final weights must be reached.
   completion_weight: 0.7
   global_weight: 0.3
   weight_schedule:
-    start_step: 150
-    end_step: 250
+    start_step: 100
+    end_step: 199
     completion_end_weight: 0.4
     global_end_weight: 0.6
   provider: qwen_dashscope

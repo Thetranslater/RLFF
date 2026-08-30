@@ -2,7 +2,7 @@
 experiment_name: rlff-phase-d
 trial_name: trial0
 seed: 0
-total_train_epochs: 2
+total_train_epochs: 1
 tokenizer_path: models/base/Qwen2.5-7B-Instruct
 enable_offload: true
 
@@ -85,8 +85,13 @@ rollout:
   backend: sglang:d1
   experiment_name: rlff-phase-d
   trial_name: trial0
-  max_concurrent_rollouts: 32
-  queue_size: null
+  # Keep exactly one episode/GRPO group in flight. AReaL v1.0.4 restores the
+  # inference-engine version from the checkpoint but resets rollout counters;
+  # values greater than one can therefore cause a large rollout burst on resume.
+  max_concurrent_rollouts: 1
+  # AReaL reserves one batch slot when calculating queue capacity, so a
+  # batch_size of 1 requires queue_size >= 2 to submit the first rollout.
+  queue_size: 2
   consumer_batch_size: 1
   max_head_offpolicyness: 0
   enable_rollout_tracing: false
@@ -121,7 +126,7 @@ sglang:
   attention_backend: triton
   sampling_backend: pytorch
   max_running_requests: null
-  context_length: 6144
+  context_length: 11400
   # Leave enough headroom for the colocated FSDP actor during onload/update.
   mem_fraction_static: 0.6
   enable_lora: true
@@ -135,7 +140,7 @@ train_dataset:
   num_workers: 0
   path: data/episodes.jsonl
   type: rl
-  max_length: 6144
+  max_length: 11400
 
 valid_dataset: null
 

@@ -69,8 +69,8 @@ def test_config_hierarchy_defaults_and_non_secret_snapshot(
     assert config.rewards.global_reward.temperature == 0.7
     assert config.rewards.completion.reasoning_effort == "medium"
     assert config.rewards.global_reward.reasoning_effort == "medium"
-    assert config.rewards.completion.max_tokens == 16384
-    assert config.rewards.global_reward.max_tokens == 16384
+    assert config.rewards.completion.max_tokens == 18000
+    assert config.rewards.global_reward.max_tokens == 18000
     assert config.rewards.completion_weight == 0.7
     assert config.rewards.global_weight == 0.3
     assert config.rewards.weight_schedule is not None

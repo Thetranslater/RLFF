@@ -49,7 +49,7 @@ QWEN_BASE_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-
 QWEN_API_KEY_ENV = "DASHSCOPE_API_KEY"
 QWEN_TEMPERATURE = 0.7
 QWEN_REASONING_EFFORT = "medium"
-QWEN_MAX_COMPLETION_TOKENS = 16384
+QWEN_MAX_COMPLETION_TOKENS = 18000
 
 
 class QwenDashScopeTransport:

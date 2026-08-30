@@ -287,9 +287,11 @@ async def test_deepseek_invalid_json_retries_then_returns_invalid() -> None:
     sample = trajectory(source)
     transport = FakeTransport(
         [
-            "not-json",
-            '{"scores": []}',
-            '{"scores": [], "extra": 2}',
+            json.dumps({"choices": [{"message": {"content": "not-json"}}]}),
+            json.dumps({"choices": [{"message": {"content": '{"scores": []}'}}]}),
+            json.dumps(
+                {"choices": [{"message": {"content": '{"scores": [], "extra": 2}'}}]}
+            ),
         ]
     )
     provider = DeepSeekRewardProvider(
@@ -304,10 +306,27 @@ async def test_deepseek_invalid_json_retries_then_returns_invalid() -> None:
     assert result.reward is None
     assert result.error and "exhausted" in result.error
     assert result.raw_response is not None
-    repair_system = transport.calls[1]["payload"]["messages"][0]["content"]
-    assert "not-json" in repair_system
-    assert '"index": 0' in repair_system
-    assert "invalid reward response" in repair_system
+    second_messages = transport.calls[1]["payload"]["messages"]
+    third_messages = transport.calls[2]["payload"]["messages"]
+    assert [message["role"] for message in second_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert [message["role"] for message in third_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert second_messages[2]["content"] == "not-json"
+    repair_user = second_messages[3]["content"]
+    assert "not-json" in repair_user
+    assert '"index": 0' in repair_user
+    assert "invalid reward response" in repair_user
 
 
 @pytest.mark.asyncio
@@ -443,11 +462,16 @@ async def test_qwen_repairs_invalid_completion_coverage_with_indexed_utters() ->
 
     assert result.status is RewardStatus.VALID
     assert len(transport.calls) == 2
-    repair_system = transport.calls[1]["payload"]["input"]["messages"][0]["content"][0][
-        "text"
+    repair_messages = transport.calls[1]["payload"]["input"]["messages"]
+    assert [message["role"] for message in repair_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
     ]
-    assert "expected 1, received 2" in repair_system
-    assert '"index": 0' in repair_system
+    repair_user = repair_messages[3]["content"][0]["text"]
+    assert "expected 1, received 2" in repair_user
+    assert '"index": 0' in repair_user
 
 
 @pytest.mark.asyncio
@@ -491,6 +515,15 @@ async def test_qwen_terminal_failure_logs_every_attempt_thinking_and_reply(
     assert all(json.loads(attempt["content"])["scores"] == {} for attempt in record["attempts"])
     assert all("error" in attempt for attempt in record["attempts"])
     assert "request" in record["attempts"][0]
+    request_messages = [
+        attempt["request"]["input"]["messages"] for attempt in record["attempts"]
+    ]
+    assert [len(messages) for messages in request_messages] == [2, 4, 6]
+    assert [[message["role"] for message in messages] for messages in request_messages] == [
+        ["system", "user"],
+        ["system", "user", "assistant", "user"],
+        ["system", "user", "assistant", "user", "assistant", "user"],
+    ]
     assert record["protocol_payload"]["ids"]["episode_id"] == source.episode_id
 
 

@@ -178,7 +178,7 @@ class RewardScopeConfig(ConfigModel):
     concurrency: _POSITIVE_INT = 4
     temperature: StrictFloat = 0.7
     reasoning_effort: Literal["low", "medium", "high", "max"] = "medium"
-    max_tokens: _POSITIVE_INT = 16384
+    max_tokens: _POSITIVE_INT = 18000
 
     @field_validator("timeout_seconds")
     @classmethod
@@ -230,7 +230,7 @@ class RewardConfig(ConfigModel):
     global_reward: RewardScopeConfig = Field(
         validation_alias=AliasChoices("global_reward", "global")
     )
-    repair_prompt_path: Path = Path("prompts/error_system.txt")
+    repair_prompt_path: Path = Path("prompts/error_user.txt")
     completion_weight: StrictFloat = 0.6
     global_weight: StrictFloat = 0.4
     weight_schedule: RewardWeightScheduleConfig | None = None

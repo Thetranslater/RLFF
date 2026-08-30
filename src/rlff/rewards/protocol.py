@@ -28,7 +28,7 @@ COMPLETION_REWARD_PROMPT_FILENAME: Final = "completion_reward_system_v2.txt"
 TRAJECTORY_REWARD_PROMPT_FILENAME: Final = "trajectory_reward_system.txt"
 
 
-REPAIR_REWARD_PROMPT_FILENAME: Final = "error_system.txt"
+REPAIR_REWARD_PROMPT_FILENAME: Final = "error_user.txt"
 
 
 DEFAULT_REPAIR_PROMPT: Final = (

@@ -692,13 +692,13 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             "stream": False,
         }
 
-    def _completion_repair_messages(
+    def _completion_repair_message(
         self,
         *,
         payload: Mapping[str, Any],
         json_result: str,
         error_message: str,
-    ) -> list[dict[str, str]]:
+    ) -> dict[str, str]:
         identifiers = payload.get("ids")
         if not isinstance(identifiers, Mapping):
             raise RewardResponseError("completion repair payload is missing ids")
@@ -720,12 +720,7 @@ class DeepSeekRewardProvider(_RewardProviderBase):
             },
             required=("json_result", "error_message", "character", "utters"),
         )
-        return _json_payload(
-            [
-                {"role": "system", "content": rendered},
-                {"role": "user", "content": "请仅返回修复后的 JSON 结果。"},
-            ]
-        )
+        return {"role": "user", "content": rendered}
 
     async def _request_reward(
         self,
@@ -912,14 +907,22 @@ class DeepSeekRewardProvider(_RewardProviderBase):
                     attempt_records.append(attempt_record)
                     if attempt < retries:
                         if scope == "completion_local" and repair_result is not None:
-                            repair_messages = self._completion_repair_messages(
-                                payload=payload,
-                                json_result=repair_result,
-                                error_message=last_error or "invalid completion reward response",
+                            messages.extend(
+                                [
+                                    {"role": "assistant", "content": repair_result},
+                                    self._completion_repair_message(
+                                        payload=payload,
+                                        json_result=repair_result,
+                                        error_message=(
+                                            last_error
+                                            or "invalid completion reward response"
+                                        ),
+                                    ),
+                                ]
                             )
                             request_payload = self._build_request_payload(
                                 model=model,
-                                messages=repair_messages,
+                                messages=messages,
                                 temperature=self._completion_temperature,
                                 reasoning_effort=self._completion_reasoning_effort,
                                 max_tokens=self._completion_max_tokens,

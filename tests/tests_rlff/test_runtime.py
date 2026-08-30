@@ -161,8 +161,8 @@ def test_agent_workflow_kwargs_include_reward_sampling_settings(tmp_path: Path) 
     assert kwargs["trajectory_reward_temperature"] == 0.7
     assert kwargs["completion_reward_reasoning_effort"] == "medium"
     assert kwargs["trajectory_reward_reasoning_effort"] == "medium"
-    assert kwargs["completion_reward_max_tokens"] == 16384
-    assert kwargs["trajectory_reward_max_tokens"] == 16384
+    assert kwargs["completion_reward_max_tokens"] == 18000
+    assert kwargs["trajectory_reward_max_tokens"] == 18000
     assert kwargs["completion_weight"] == 0.7
     assert kwargs["global_weight"] == 0.3
     assert kwargs["reward_schedule_start_step"] == 150
