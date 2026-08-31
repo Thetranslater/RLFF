@@ -65,6 +65,13 @@ grpo:
   min_group_size: 2
   drop_incomplete_trajectory: true
   normalize_by_role: true
+  completion_advantage_gate:
+    enabled: true
+    bad_reward_threshold: 2.5
+    good_reward_threshold: 4.5
+    bad_density_threshold: 0.6
+    bad_to_good_ratio: 2.0
+    min_bad_completions: 3
 
 lora:
   base_model: models/base/Qwen2.5-7B-Instruct

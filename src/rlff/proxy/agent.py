@@ -73,6 +73,12 @@ class RLFFGroupAwareAgent:
         reward_schedule_use_proxy_version: bool = False,
         min_group_size: int = 2,
         reward_std_epsilon: float = 1e-8,
+        completion_advantage_gate_enabled: bool = False,
+        completion_bad_reward_threshold: float = 2.5,
+        completion_good_reward_threshold: float = 4.5,
+        completion_bad_density_threshold: float = 0.6,
+        completion_bad_to_good_ratio: float = 2.0,
+        completion_min_bad_completions: int = 3,
         system_prompt: str = "",
         reward_provider: ProxyRewardProvider | None = None,
         reward_provider_name: str = "qwen_dashscope",
@@ -147,6 +153,12 @@ class RLFFGroupAwareAgent:
         )
         self.min_group_size = min_group_size
         self.reward_std_epsilon = reward_std_epsilon
+        self.completion_advantage_gate_enabled = completion_advantage_gate_enabled
+        self.completion_bad_reward_threshold = completion_bad_reward_threshold
+        self.completion_good_reward_threshold = completion_good_reward_threshold
+        self.completion_bad_density_threshold = completion_bad_density_threshold
+        self.completion_bad_to_good_ratio = completion_bad_to_good_ratio
+        self.completion_min_bad_completions = completion_min_bad_completions
         self.system_prompt = system_prompt
         self._reward_provider = reward_provider
         self._reward_provider_name = reward_provider_name
@@ -552,6 +564,12 @@ class RLFFGroupAwareAgent:
                 global_weight=global_weight,
                 min_group_size=self.min_group_size,
                 reward_std_epsilon=self.reward_std_epsilon,
+                completion_advantage_gate_enabled=self.completion_advantage_gate_enabled,
+                completion_bad_reward_threshold=self.completion_bad_reward_threshold,
+                completion_good_reward_threshold=self.completion_good_reward_threshold,
+                completion_bad_density_threshold=self.completion_bad_density_threshold,
+                completion_bad_to_good_ratio=self.completion_bad_to_good_ratio,
+                completion_min_bad_completions=self.completion_min_bad_completions,
             )
             if self.dynamic_trajectory_resampling:
                 await self._publish_group_sampling_decision(state, accepted=True)

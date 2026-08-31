@@ -140,6 +140,17 @@ attempt limit. Completion-role rewards are requested only after at least one
 character has differing trajectory rewards. Rejected interactions therefore
 never enter AReaL's training batch and do not consume completion-reward calls.
 
+Both RLFF configurations enable a conservative completion-advantage gate after
+role-level GRPO normalization. A completion with reward at or below `2.5`
+cannot inherit a positive role advantage. A completion at or above `4.5` is
+protected from a negative role advantage only when the same trajectory/role
+contains at least three bad completions, bad-completion density is at least
+`0.6`, and bad completions outnumber good completions by at least `2:1`.
+Filtered completions receive scalar advantage zero, so their generated tokens
+contribute no direct policy-gradient update. The original completion loss mask
+is retained to preserve AReaL's native interaction schema and audit tooling.
+Every enabled group logs aggregate gate counts for later diagnosis.
+
 ## Rollout smoke test
 
 The smoke test randomly selects 20 unique episodes and runs one complete

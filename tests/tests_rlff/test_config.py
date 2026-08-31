@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from rlff.config import (
     BF16LoRAConfig,
+    CompletionAdvantageGateConfig,
     PromptTemplateConfig,
     RewardConfig,
     RLFFConfig,
@@ -81,6 +82,7 @@ def test_config_hierarchy_defaults_and_non_secret_snapshot(
     assert config.grpo.normalize_by_role is True
     assert config.grpo.drop_incomplete_trajectory is True
     assert config.grpo.dynamic_trajectory_resampling is False
+    assert config.grpo.completion_advantage_gate.enabled is False
 
     monkeypatch.setenv("DASHSCOPE_API_KEY", "do-not-serialize")
     secrets = config.resolve_runtime_secrets()
@@ -137,6 +139,23 @@ def test_reward_weight_schedule_rejects_invalid_range(tmp_path: Path) -> None:
     payload["rewards"] = rewards
     with pytest.raises(ValidationError, match="end_step"):
         RLFFConfig.model_validate(payload)
+
+
+def test_completion_advantage_gate_validates_thresholds_and_density() -> None:
+    gate = CompletionAdvantageGateConfig(enabled=True)
+    assert gate.bad_reward_threshold == 2.5
+    assert gate.good_reward_threshold == 4.5
+    assert gate.bad_density_threshold == 0.6
+    assert gate.bad_to_good_ratio == 2.0
+    assert gate.min_bad_completions == 3
+
+    with pytest.raises(ValidationError, match="1 <= bad < good <= 5"):
+        CompletionAdvantageGateConfig(
+            bad_reward_threshold=4.5,
+            good_reward_threshold=4.5,
+        )
+    with pytest.raises(ValidationError, match="bad_density_threshold"):
+        CompletionAdvantageGateConfig(bad_density_threshold=0.0)
 
 
 @pytest.mark.parametrize(

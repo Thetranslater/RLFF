@@ -129,6 +129,16 @@ train_dataset:
                 "global_end_weight": 0.6,
             },
         },
+        "grpo": {
+            "completion_advantage_gate": {
+                "enabled": True,
+                "bad_reward_threshold": 2.25,
+                "good_reward_threshold": 4.75,
+                "bad_density_threshold": 0.7,
+                "bad_to_good_ratio": 3.0,
+                "min_bad_completions": 4,
+            }
+        },
         "lora": {
             "base_model": "base-model",
             "sft_adapter_path": str(adapter),
@@ -171,6 +181,12 @@ def test_agent_workflow_kwargs_include_reward_sampling_settings(tmp_path: Path) 
     assert kwargs["reward_schedule_global_end_weight"] == 0.6
     assert kwargs["reward_schedule_use_proxy_version"] is False
     assert kwargs["dynamic_trajectory_resampling"] is False
+    assert kwargs["completion_advantage_gate_enabled"] is True
+    assert kwargs["completion_bad_reward_threshold"] == 2.25
+    assert kwargs["completion_good_reward_threshold"] == 4.75
+    assert kwargs["completion_bad_density_threshold"] == 0.7
+    assert kwargs["completion_bad_to_good_ratio"] == 3.0
+    assert kwargs["completion_min_bad_completions"] == 4
     assert kwargs["frequency_penalty"] == 0.0
     assert kwargs["rollout_request_timeout_seconds"] == 120.0
 
@@ -520,6 +536,81 @@ def test_proxy_role_normalization_aggregates_then_normalizes_per_role() -> None:
         assert sum(value * value for value in values) / 4 == pytest.approx(1.0)
     assert result["completion-0-Alice"] == result["completion-0-Alice"]
     assert set(result) == set(completion_rewards)
+
+
+def test_completion_advantage_gate_masks_only_direction_conflicts_with_density() -> None:
+    reward_rows = (
+        (5.0, 5.0, 5.0, 5.0, 2.0),
+        (2.0, 2.0, 2.0, 2.0, 5.0),
+        (5.0, 5.0, 5.0, 5.0, 5.0),
+        (5.0, 5.0, 5.0, 5.0, 5.0),
+    )
+    trajectory_rewards = (3.0, 0.0, 2.0, 1.0)
+    trajectories: list[ProxyTrajectoryView] = []
+    completion_rewards: dict[str, float] = {}
+    trajectory_role_rewards: dict[tuple[str, str], float] = {}
+    for trajectory_index, rewards in enumerate(reward_rows):
+        trajectory_id = f"trajectory-{trajectory_index}"
+        completions = tuple(
+            ProxyCompletionView(
+                completion_id=f"completion-{trajectory_index}-{completion_index}",
+                group_id="group-gate",
+                trajectory_id=trajectory_id,
+                character="Alice",
+                turn_index=completion_index,
+                text="reply",
+            )
+            for completion_index in range(len(rewards))
+        )
+        trajectories.append(
+            ProxyTrajectoryView(
+                group_id="group-gate",
+                trajectory_id=trajectory_id,
+                episode_id="episode-gate",
+                episode={"episode_id": "episode-gate"},
+                completions=completions,
+                turns=(),
+                planned_rounds=len(rewards),
+                completed_rounds=len(rewards),
+            )
+        )
+        for completion, reward in zip(completions, rewards, strict=True):
+            completion_rewards[completion.completion_id] = reward
+        trajectory_role_rewards[(trajectory_id, "Alice")] = trajectory_rewards[
+            trajectory_index
+        ]
+
+    result = normalize_proxy_role_advantages(
+        trajectories,
+        completion_rewards,
+        trajectory_role_rewards,
+        completion_weight=0.0,
+        global_weight=1.0,
+        min_group_size=4,
+        completion_advantage_gate_enabled=True,
+    )
+
+    # One bad completion cannot inherit trajectory 0's positive advantage.
+    assert result["completion-0-4"] == 0.0
+    assert result["completion-0-0"] > 0.0
+    # The one good completion in trajectory 1's dense bad majority is protected.
+    assert result["completion-1-4"] == 0.0
+    assert result["completion-1-0"] < 0.0
+    # High scores alone do not suppress a negative trajectory advantage.
+    assert result["completion-3-0"] < 0.0
+
+
+def test_completion_advantage_gate_is_disabled_by_default() -> None:
+    trajectories, completion_rewards, trajectory_role_rewards = _proxy_group()
+    result = normalize_proxy_role_advantages(
+        trajectories,
+        completion_rewards,
+        trajectory_role_rewards,
+        completion_weight=0.5,
+        global_weight=0.5,
+        min_group_size=4,
+    )
+    assert result["completion-0-Alice"] < 0.0
 
 
 def test_group_agent_barrier_returns_only_own_session_rewards() -> None:

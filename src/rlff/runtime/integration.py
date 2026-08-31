@@ -344,6 +344,7 @@ def build_agent_workflow_kwargs(config: RLFFConfig) -> dict[str, Any]:
     """Translate RLFF-owned rollout/reward settings to the agent constructor."""
 
     schedule = config.rewards.weight_schedule
+    completion_gate = config.grpo.completion_advantage_gate
     return {
         "group_size": config.episode_grouping.group_size,
         "max_rounds": config.rollout.max_rounds,
@@ -367,6 +368,12 @@ def build_agent_workflow_kwargs(config: RLFFConfig) -> dict[str, Any]:
         "reward_schedule_use_proxy_version": False,
         "min_group_size": config.grpo.min_group_size,
         "reward_std_epsilon": config.grpo.reward_std_epsilon,
+        "completion_advantage_gate_enabled": completion_gate.enabled,
+        "completion_bad_reward_threshold": completion_gate.bad_reward_threshold,
+        "completion_good_reward_threshold": completion_gate.good_reward_threshold,
+        "completion_bad_density_threshold": completion_gate.bad_density_threshold,
+        "completion_bad_to_good_ratio": completion_gate.bad_to_good_ratio,
+        "completion_min_bad_completions": completion_gate.min_bad_completions,
         "dynamic_trajectory_resampling": config.grpo.dynamic_trajectory_resampling,
         "reward_provider_name": config.rewards.provider,
         "reward_api_key_env": config.rewards.api_key_env,

@@ -262,6 +262,51 @@ class RewardConfig(ConfigModel):
         return self
 
 
+class CompletionAdvantageGateConfig(ConfigModel):
+    """Conservative per-completion filtering after role-level normalization.
+
+    A clearly bad completion never inherits a positive role advantage.  A
+    clearly good completion is protected from a negative role advantage only
+    when bad completions form a dense majority in the same trajectory/role.
+    """
+
+    enabled: StrictBool = False
+    bad_reward_threshold: StrictFloat = 2.5
+    good_reward_threshold: StrictFloat = 4.5
+    bad_density_threshold: StrictFloat = 0.6
+    bad_to_good_ratio: StrictFloat = 2.0
+    min_bad_completions: _POSITIVE_INT = 3
+
+    @field_validator(
+        "bad_reward_threshold",
+        "good_reward_threshold",
+        "bad_density_threshold",
+        "bad_to_good_ratio",
+    )
+    @classmethod
+    def gate_numbers_are_non_negative(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("completion advantage gate values must be non-negative")
+        return value
+
+    @model_validator(mode="after")
+    def validate_gate(self) -> CompletionAdvantageGateConfig:
+        if not 1 <= self.bad_reward_threshold < self.good_reward_threshold <= 5:
+            raise ValueError(
+                "completion advantage gate reward thresholds must satisfy "
+                "1 <= bad < good <= 5"
+            )
+        if not 0 < self.bad_density_threshold <= 1:
+            raise ValueError(
+                "completion advantage gate bad_density_threshold must be in (0, 1]"
+            )
+        if self.bad_to_good_ratio < 1:
+            raise ValueError(
+                "completion advantage gate bad_to_good_ratio must be at least 1"
+            )
+        return self
+
+
 class RoleGRPOConfig(ConfigModel):
     """Numerical role-level GRPO post-processing settings."""
 
@@ -273,6 +318,9 @@ class RoleGRPOConfig(ConfigModel):
     # character's raw trajectory reward differs across trajectories. Rejected
     # groups are regenerated from the same episode without an attempt limit.
     dynamic_trajectory_resampling: StrictBool = False
+    completion_advantage_gate: CompletionAdvantageGateConfig = Field(
+        default_factory=CompletionAdvantageGateConfig
+    )
 
     @field_validator("reward_std_epsilon")
     @classmethod
