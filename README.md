@@ -16,8 +16,11 @@ rlff_phase_d/
   configs/
     rlff.yaml                 RLFF-owned configuration
     areal.yaml                pinned AReaL v1.0.4 native configuration
+    rlff_epoch2.yaml          RLFF config for resuming into epoch two
+    areal_epoch2.yaml         native config with DAPO clipping for epoch two
   data/
     episodes.jsonl            exactly 200 canonical episodes
+    episodes_epoch2.jsonl     same episodes, stable mixed curriculum order
   models/
     base/Qwen2.5-7B-Instruct/ Hugging Face BF16 base model
     adapters/qwen2.5-7b-instruct-sft/ PEFT LoRA adapter continued by RLFF
@@ -100,6 +103,42 @@ change `trial_name` first. Keep `outputs/areal` on persistent storage.
 The `checkpoint` block in `configs/rlff.yaml` is RLFF-side output metadata; the
 effective native save and recovery schedules are the `saver` and `recover`
 blocks in `configs/areal.yaml`.
+
+To prepare epoch two, generate the ordered copy from the bundle root:
+
+```bash
+python scripts/build_epoch2_dataset.py data/episodes.jsonl data/episodes_epoch2.jsonl
+```
+
+After the first epoch checkpoint is complete, resume with the epoch-two pair:
+
+```bash
+rlff train --config configs/rlff_epoch2.yaml
+```
+
+This keeps the same AReaL experiment, trial, and recovery fileroot, while
+`areal_epoch2.yaml` raises `total_train_epochs` to 2 and enables DAPO-style
+asymmetric clipping (`eps_clip=0.2`, `eps_clip_higher=0.28`). The ordered
+dataset uses a stable mixed curriculum: the first 100 records contain 70 easy
+and 30 normal/difficult episodes; the last 100 contain 30 easy and 70
+normal/difficult episodes. Each half distributes both classes throughout the
+sequence while preserving the original relative order inside each class. No
+episode content or per-record fingerprint is changed.
+
+Use this configuration only from the exact first-epoch boundary (the recovery
+record whose next global step is 200). AReaL restores the stateful dataloader
+cursor together with model and optimizer state. Resuming this configuration
+from a mid-epoch checkpoint would therefore enter `episodes_epoch2.jsonl` at
+the restored cursor instead of beginning its easy-first order at record zero.
+
+The epoch-two RLFF config also enables same-episode dynamic resampling. For
+each attempt, all four trajectories are generated in independent proxy
+sessions and only trajectory-role rewards are requested first. If every
+character has the same trajectory reward across all four trajectories, the
+entire group is discarded and the same episode is sampled again with no
+attempt limit. Completion-role rewards are requested only after at least one
+character has differing trajectory rewards. Rejected interactions therefore
+never enter AReaL's training batch and do not consume completion-reward calls.
 
 ## Rollout smoke test
 

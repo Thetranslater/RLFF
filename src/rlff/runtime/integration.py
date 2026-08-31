@@ -367,6 +367,7 @@ def build_agent_workflow_kwargs(config: RLFFConfig) -> dict[str, Any]:
         "reward_schedule_use_proxy_version": False,
         "min_group_size": config.grpo.min_group_size,
         "reward_std_epsilon": config.grpo.reward_std_epsilon,
+        "dynamic_trajectory_resampling": config.grpo.dynamic_trajectory_resampling,
         "reward_provider_name": config.rewards.provider,
         "reward_api_key_env": config.rewards.api_key_env,
         "reward_base_url": config.rewards.base_url,

@@ -1,0 +1,111 @@
+episode_grouping:
+  dataset_path: data/episodes_epoch2.jsonl
+  group_size: 4
+  base_seed: 0
+  limit: 200
+
+prompt:
+  template_paths:
+    - prompts/sft_system_v1.txt
+    - prompts/sft_system_v2.txt
+    - prompts/sft_system_v3.txt
+  template_ids: [sft_system_v1, sft_system_v2, sft_system_v3]
+  default_template_id: sft_system_v1
+
+rollout:
+  max_rounds: 7
+
+sglang:
+  model: models/base/Qwen2.5-7B-Instruct
+  base_url: http://127.0.0.1:30000
+  temperature: 1.0
+  top_p: 0.9
+  frequency_penalty: 1.2
+  max_new_tokens: 256
+  context_length: 11400
+  timeout_seconds: 120.0
+
+rewards:
+  repair_prompt_path: prompts/error_user.txt
+  completion:
+    model: qwen3.7-flash
+    prompt_path: prompts/completion_reward_system_v2.txt
+    timeout_seconds: 120.0
+    retries: 2
+    concurrency: 4
+    temperature: 0.7
+    reasoning_effort: medium
+    max_tokens: 18000
+  global_reward:
+    model: qwen3.7-flash
+    prompt_path: prompts/trajectory_reward_system.txt
+    timeout_seconds: 120.0
+    retries: 2
+    concurrency: 4
+    temperature: 0.7
+    reasoning_effort: medium
+    max_tokens: 18000
+  completion_weight: 0.7
+  global_weight: 0.3
+  weight_schedule:
+    start_step: 100
+    end_step: 199
+    completion_end_weight: 0.4
+    global_end_weight: 0.6
+  provider: qwen_dashscope
+  api_key_env: DASHSCOPE_API_KEY
+  base_url: https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
+
+grpo:
+  reward_std_epsilon: 1.0e-8
+  min_group_size: 2
+  drop_incomplete_trajectory: true
+  normalize_by_role: true
+  dynamic_trajectory_resampling: true
+
+lora:
+  base_model: models/base/Qwen2.5-7B-Instruct
+  sft_adapter_path: models/adapters/qwen2.5-7b-instruct-sft
+  dtype: bfloat16
+  rank: 48
+  alpha: 96
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  peft_type: lora
+
+areal:
+  version: "1.0.4"
+  commit: 37d6c6400e99a05fa3409d6a067762a44df40d3b
+  sglang_version: 0.5.10.post1
+  official_yaml: configs/areal_epoch2.yaml
+  world_size: 1
+  rank: 0
+  rollout_workers: 1
+  use_bf16: true
+  native_n_samples: 4
+  native_reward_norm: none
+  native_adv_norm: none
+  native_reward_scaling: 1.0
+  native_reward_bias: 0.0
+  native_discount: 1.0
+  native_gae_lambda: 1.0
+  proxy_base_url: http://127.0.0.1:8000
+  proxy_admin_api_key_env: AREAL_PROXY_ADMIN_API_KEY
+  proxy_mode: inline
+  proxy_turn_discount: 0.0
+  proxy_export_style: individual
+  proxy_group_timeout_seconds: 600.0
+
+checkpoint:
+  output_dir: outputs/checkpoints
+  every_steps: 100
+  keep_last: 3
+
+observability:
+  langsmith_tracing: false
+  langsmith_project: rlff-phase-d
+  langsmith_api_key_env: LANGSMITH_API_KEY
+  audit_jsonl: outputs/reward-audit.jsonl
+  reward_detail_jsonl: outputs/reward-detail-samples.jsonl
+  reward_detail_sample_rate: 0.015625
+  reward_failure_jsonl: outputs/reward-failures.jsonl
+  training_metrics_jsonl: outputs/training-metrics.jsonl

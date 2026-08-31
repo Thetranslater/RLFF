@@ -269,6 +269,10 @@ class RoleGRPOConfig(ConfigModel):
     min_group_size: _POSITIVE_INT = 2
     drop_incomplete_trajectory: Literal[True] = True
     normalize_by_role: Literal[True] = True
+    # When enabled, a complete group is accepted only if at least one
+    # character's raw trajectory reward differs across trajectories. Rejected
+    # groups are regenerated from the same episode without an attempt limit.
+    dynamic_trajectory_resampling: StrictBool = False
 
     @field_validator("reward_std_epsilon")
     @classmethod

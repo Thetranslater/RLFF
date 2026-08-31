@@ -80,6 +80,7 @@ def test_config_hierarchy_defaults_and_non_secret_snapshot(
     assert config.areal.use_bf16 is True
     assert config.grpo.normalize_by_role is True
     assert config.grpo.drop_incomplete_trajectory is True
+    assert config.grpo.dynamic_trajectory_resampling is False
 
     monkeypatch.setenv("DASHSCOPE_API_KEY", "do-not-serialize")
     secrets = config.resolve_runtime_secrets()

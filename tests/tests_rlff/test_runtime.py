@@ -170,6 +170,7 @@ def test_agent_workflow_kwargs_include_reward_sampling_settings(tmp_path: Path) 
     assert kwargs["reward_schedule_completion_end_weight"] == 0.4
     assert kwargs["reward_schedule_global_end_weight"] == 0.6
     assert kwargs["reward_schedule_use_proxy_version"] is False
+    assert kwargs["dynamic_trajectory_resampling"] is False
     assert kwargs["frequency_penalty"] == 0.0
     assert kwargs["rollout_request_timeout_seconds"] == 120.0
 
@@ -605,6 +606,196 @@ def test_group_agent_barrier_returns_only_own_session_rewards() -> None:
     assert len(provider.completion_calls) == 8
     assert len(provider.trajectory_calls) == 8
     assert agent._reward_schedule_step == 150
+
+
+def test_dynamic_group_scores_trajectory_first_and_skips_completion_when_rejected() -> None:
+    class FakeProvider:
+        def __init__(self) -> None:
+            self.completion_calls: list[str] = []
+            self.trajectory_calls: list[str] = []
+
+        async def score_proxy_completion_role(self, payload: dict[str, Any]) -> dict[str, float]:
+            completion_ids = tuple(str(value) for value in payload["ids"]["completion_ids"])
+            self.completion_calls.extend(completion_ids)
+            return {completion_id: 1.0 for completion_id in completion_ids}
+
+        async def score_proxy_trajectory_role(self, payload: dict[str, Any]) -> float:
+            trajectory_id = str(payload["ids"]["trajectory_id"])
+            self.trajectory_calls.append(trajectory_id)
+            attempt_text = trajectory_id.rsplit(":attempt:", 1)[1]
+            attempt = int(attempt_text.split(":", 1)[0])
+            slot = int(trajectory_id.rsplit(":", 1)[1])
+            character = str(payload["ids"]["character"])
+            # Attempt one is accepted because Bob varies even though Alice is
+            # still constant across all four trajectories.
+            return 0.0 if attempt == 0 or character == "Alice" else float(slot)
+
+    provider = FakeProvider()
+
+    async def run_trajectory(data: dict[str, Any], **kwargs: Any) -> ProxyTrajectoryView:
+        trajectory_id = str(kwargs["trajectory_id"])
+        completions = tuple(
+            ProxyCompletionView(
+                completion_id=f"{trajectory_id}:{character}",
+                group_id="group-1",
+                trajectory_id=trajectory_id,
+                character=character,
+                turn_index=turn,
+                text="ok",
+            )
+            for turn, character in enumerate(("Alice", "Bob"))
+        )
+        return ProxyTrajectoryView(
+            group_id="group-1",
+            trajectory_id=trajectory_id,
+            episode_id="episode-1",
+            episode={
+                "episode_id": "episode-1",
+                "plot": "test",
+                "characters": [{"name": "Alice"}, {"name": "Bob"}],
+            },
+            completions=completions,
+            turns=(),
+            planned_rounds=1,
+            completed_rounds=1,
+        )
+
+    agent = RLFFGroupAwareAgent(
+        group_size=4,
+        reward_provider=provider,
+        trajectory_runner=run_trajectory,
+        dynamic_trajectory_resampling=True,
+        min_group_size=4,
+    )
+
+    async def run_attempt(attempt: int) -> tuple[list[dict[str, float]], bool]:
+        data = {"group_id": "group-1", "_rlff_resample_attempt": attempt}
+        results = await asyncio.gather(
+            *(
+                agent.run(
+                    data,
+                    base_url="http://proxy",
+                    http_client=object(),
+                    api_key="session",
+                )
+                for _ in range(4)
+            )
+        )
+        return results, await agent.consume_group_sampling_decision(data)
+
+    async def execute() -> tuple[
+        tuple[list[dict[str, float]], bool, int, int, int],
+        tuple[list[dict[str, float]], bool],
+    ]:
+        rejected_results, rejected = await run_attempt(0)
+        rejected_attempt = (
+            rejected_results,
+            rejected,
+            len(provider.completion_calls),
+            len(provider.trajectory_calls),
+            agent._reward_schedule_step,
+        )
+        accepted_attempt = await run_attempt(1)
+        return rejected_attempt, accepted_attempt
+
+    (
+        rejected_results,
+        rejected,
+        completion_calls_after_rejection,
+        trajectory_calls_after_rejection,
+        schedule_step_after_rejection,
+    ), (accepted_results, accepted) = asyncio.run(execute())
+    assert rejected is False
+    assert completion_calls_after_rejection == 0
+    assert trajectory_calls_after_rejection == 8
+    assert all(set(result.values()) == {0.0} for result in rejected_results)
+    assert schedule_step_after_rejection == 0
+
+    assert accepted is True
+    assert len(provider.completion_calls) == 8
+    assert len(provider.trajectory_calls) == 16
+    assert all(len(result) == 2 for result in accepted_results)
+    assert agent._reward_schedule_step == 1
+
+
+def test_dynamic_group_wrapper_retries_same_episode_with_fresh_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rlff.proxy.dynamic_sampling import install_same_episode_group_wrapper
+
+    class FakeRolloutWorkflow:
+        pass
+
+    class FakeInteraction:
+        pass
+
+    class OriginalGroupedWorkflow:
+        pass
+
+    fake_areal = ModuleType("areal")
+    fake_api = ModuleType("areal.api")
+    fake_api.RolloutWorkflow = FakeRolloutWorkflow  # type: ignore[attr-defined]
+    fake_experimental = ModuleType("areal.experimental")
+    fake_openai = ModuleType("areal.experimental.openai")
+    fake_openai.InteractionWithTokenLogpReward = FakeInteraction  # type: ignore[attr-defined]
+    fake_infra = ModuleType("areal.infra")
+    fake_remote = ModuleType("areal.infra.remote_inf_engine")
+    fake_remote.GroupedRolloutWorkflow = OriginalGroupedWorkflow  # type: ignore[attr-defined]
+    fake_infra.remote_inf_engine = fake_remote  # type: ignore[attr-defined]
+    fake_utils = ModuleType("areal.utils")
+    fake_data = ModuleType("areal.utils.data")
+    fake_data.concat_padded_tensors = lambda values: {"values": values}  # type: ignore[attr-defined]
+
+    for name, module in {
+        "areal": fake_areal,
+        "areal.api": fake_api,
+        "areal.experimental": fake_experimental,
+        "areal.experimental.openai": fake_openai,
+        "areal.infra": fake_infra,
+        "areal.infra.remote_inf_engine": fake_remote,
+        "areal.utils": fake_utils,
+        "areal.utils.data": fake_data,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    class FakeAgent:
+        dynamic_trajectory_resampling = True
+
+        def __init__(self) -> None:
+            self.decisions = [False, True]
+
+        async def consume_group_sampling_decision(self, data: dict[str, Any]) -> bool:
+            assert data["episode"] == "same-episode"
+            return self.decisions.pop(0)
+
+    class FakeInnerWorkflow:
+        def __init__(self) -> None:
+            self.agent = FakeAgent()
+            self.calls: list[int] = []
+
+        async def arun_episode(self, _engine: Any, data: dict[str, Any]) -> dict[str, Any]:
+            attempt = int(data["_rlff_resample_attempt"])
+            slot = sum(value == attempt for value in self.calls)
+            self.calls.append(attempt)
+            return {f"attempt-{attempt}-slot-{slot}": FakeInteraction()}
+
+    assert install_same_episode_group_wrapper() is True
+    wrapper_class = fake_remote.GroupedRolloutWorkflow  # type: ignore[attr-defined]
+    inner = FakeInnerWorkflow()
+    logger = SimpleNamespace(info=lambda *_args, **_kwargs: None, warning=lambda *_a: None)
+    wrapper = wrapper_class(inner, 4, logger)
+    result = asyncio.run(
+        wrapper.arun_episode(object(), {"episode": "same-episode"})
+    )
+
+    assert inner.calls == [0, 0, 0, 0, 1, 1, 1, 1]
+    assert result is not None
+    assert set(result) == {
+        "attempt-1-slot-0",
+        "attempt-1-slot-1",
+        "attempt-1-slot-2",
+        "attempt-1-slot-3",
+    }
 
 
 def test_group_agent_barrier_failure_fails_every_run() -> None:

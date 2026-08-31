@@ -1,0 +1,174 @@
+# Native AReaL configuration for resuming the first completed epoch.
+# Keep the same experiment/trial/fileroot so recover/optimizer state is reused.
+experiment_name: rlff-phase-d
+trial_name: trial0
+seed: 0
+total_train_epochs: 2
+tokenizer_path: models/base/Qwen2.5-7B-Instruct
+enable_offload: true
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 1
+  fileroot: outputs/areal
+  name_resolve:
+    type: nfs
+    nfs_record_root: outputs/areal/name_resolve
+
+scheduler:
+  type: local
+
+gconfig:
+  n_samples: 4
+  min_new_tokens: 0
+  max_new_tokens: 256
+  greedy: false
+  temperature: 1.0
+  top_p: 0.9
+  lora_name: default_lora
+
+actor:
+  backend: fsdp:d1
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  path: models/base/Qwen2.5-7B-Instruct
+  init_from_scratch: false
+  attn_impl: sdpa
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 8192
+  optimizer:
+    type: adam
+    lr: 1.0e-6
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.0
+  eps_clip: 0.2
+  eps_clip_higher: 0.28
+  temperature: 1.0
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  reward_norm: null
+  adv_norm: null
+  discount: 1.0
+  gae_lambda: 1.0
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: false
+  use_decoupled_loss: false
+  max_new_tokens: 256
+  weight_update_mode: disk
+  use_lora: true
+  peft_type: lora
+  lora_rank: 48
+  lora_alpha: 96
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+rollout:
+  backend: sglang:d1
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  max_concurrent_rollouts: 1
+  queue_size: 2
+  consumer_batch_size: 1
+  max_head_offpolicyness: 0
+  enable_rollout_tracing: false
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python -m areal.infra.rpc.rpc_server
+      env_vars:
+        TMS_INIT_ENABLE: "0"
+  use_lora: true
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  agent:
+    agent_cls_path: rlff.runtime:RLFFGroupAwareAgent
+    mode: inline
+    turn_discount: 0.0
+    export_style: individual
+
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: bfloat16
+  attention_backend: triton
+  sampling_backend: pytorch
+  max_running_requests: null
+  context_length: 11400
+  mem_fraction_static: 0.6
+  enable_lora: true
+  max_lora_rank: 48
+  enable_memory_saver: true
+
+train_dataset:
+  batch_size: 1
+  shuffle: false
+  pin_memory: true
+  num_workers: 0
+  path: data/episodes_epoch2.jsonl
+  type: rl
+  max_length: 11400
+
+valid_dataset: null
+
+saver:
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  fileroot: ${cluster.fileroot}
+  mode: sync
+  freq_epochs: 1
+  freq_steps: 20
+  freq_secs: null
+
+recover:
+  mode: auto
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  fileroot: ${cluster.fileroot}
+  retries: 3
+  no_save_optim: false
+  no_load_optim: false
+  freq_epochs: 1
+  freq_steps: 10
+  freq_secs: null
+
+evaluator:
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: rlff-phase-d
+  trial_name: trial0
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

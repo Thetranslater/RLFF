@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 from ..rollout import rounds_for_character_count
+from .dynamic_sampling import attempt_index, install_same_episode_group_wrapper
 from .grouping import _group_character_order, logger, reward_weights_for_step
 from .normalization import (
     _mapping_value,
@@ -33,6 +34,7 @@ from .types import (
 
 @dataclass(slots=True)
 class _GroupState:
+    key: str
     expected: int
     future: asyncio.Future[dict[str, float]]
     reward_step: int
@@ -102,6 +104,7 @@ class RLFFGroupAwareAgent:
         reward_detail_jsonl: str | None = None,
         reward_detail_sample_rate: float = 0.0,
         reward_failure_jsonl: str | None = None,
+        dynamic_trajectory_resampling: bool = False,
         trajectory_runner: ProxyTrajectoryRunner | None = None,
     ) -> None:
         if type(group_size) is not int or group_size <= 0:
@@ -112,6 +115,8 @@ class RLFFGroupAwareAgent:
             raise ValueError("group_timeout_seconds must be positive")
         if rollout_request_timeout_seconds <= 0:
             raise ValueError("rollout_request_timeout_seconds must be positive")
+        if type(dynamic_trajectory_resampling) is not bool:
+            raise ValueError("dynamic_trajectory_resampling must be a boolean")
         if not -2 <= frequency_penalty <= 2:
             raise ValueError("frequency_penalty must be between -2 and 2")
         self.group_size = group_size
@@ -171,8 +176,12 @@ class RLFFGroupAwareAgent:
         self._reward_detail_jsonl = reward_detail_jsonl
         self._reward_detail_sample_rate = reward_detail_sample_rate
         self._reward_failure_jsonl = reward_failure_jsonl
+        self.dynamic_trajectory_resampling = dynamic_trajectory_resampling
+        if self.dynamic_trajectory_resampling:
+            install_same_episode_group_wrapper()
         self._trajectory_runner = trajectory_runner
         self._states: dict[str, _GroupState] = {}
+        self._sampling_decisions: dict[str, bool] = {}
         self._states_lock = asyncio.Lock()
         self._reward_schedule_lock = asyncio.Lock()
 
@@ -298,7 +307,14 @@ class RLFFGroupAwareAgent:
             task_id = workflow_context.get().task_id
         except Exception:  # CPU fake/unit-test path
             task_id = None
-        return f"{task_id if task_id is not None else 'local'}:{self._group_id(data)}"
+        base = f"{task_id if task_id is not None else 'local'}:{self._group_id(data)}"
+        if self.dynamic_trajectory_resampling:
+            try:
+                attempt = attempt_index(data)
+            except ValueError as exc:
+                raise ProxyGroupError(str(exc)) from exc
+            return f"{base}:attempt:{attempt}"
+        return base
 
     async def _resolve_reward_step(self, base_url: str, http_client: Any) -> int:
         if not self._reward_schedule_use_proxy_version:
@@ -325,6 +341,7 @@ class RLFFGroupAwareAgent:
                     asyncio.get_running_loop().create_future()
                 )
                 state = _GroupState(
+                    key=key,
                     expected=self.group_size,
                     future=future,
                     reward_step=reward_step,
@@ -336,6 +353,31 @@ class RLFFGroupAwareAgent:
                 self._fail_state(state, error)
                 raise error
             return state
+
+    async def consume_group_sampling_decision(self, data: Mapping[str, Any]) -> bool:
+        """Consume the trajectory-first decision for one completed group attempt."""
+
+        key = self._group_key(data)
+        async with self._states_lock:
+            try:
+                return self._sampling_decisions.pop(key)
+            except KeyError as exc:
+                raise ProxyGroupError(
+                    f"missing dynamic-sampling decision for proxy group {key!r}"
+                ) from exc
+
+    async def _publish_group_sampling_decision(
+        self,
+        state: _GroupState,
+        *,
+        accepted: bool,
+    ) -> None:
+        async with self._states_lock:
+            if state.key in self._sampling_decisions:
+                raise ProxyGroupError(
+                    f"duplicate dynamic-sampling decision for proxy group {state.key!r}"
+                )
+            self._sampling_decisions[state.key] = accepted
 
     @staticmethod
     def _consume_future_exception(future: asyncio.Future[dict[str, float]]) -> None:
@@ -359,6 +401,40 @@ class RLFFGroupAwareAgent:
         async with self._reward_schedule_lock:
             await self._score_group_at_step(state)
 
+    @staticmethod
+    def _trajectory_rewards_are_informative(
+        trajectory_role_rewards: Mapping[tuple[str, str], float],
+        trajectories: Sequence[ProxyTrajectoryView],
+    ) -> bool:
+        """Return true when any character varies across the complete group."""
+
+        if not trajectories:
+            raise ProxyGroupError("cannot filter an empty trajectory group")
+        characters = tuple(
+            dict.fromkeys(
+                completion.character
+                for completion in trajectories[0].completions
+            )
+        )
+        if not characters:
+            raise ProxyGroupError("trajectory group has no characters")
+        for trajectory in trajectories:
+            actual = {
+                completion.character for completion in trajectory.completions
+            }
+            if actual != set(characters):
+                raise ProxyGroupError(
+                    f"trajectory {trajectory.trajectory_id!r} role set differs from group"
+                )
+        for character in characters:
+            values = [
+                trajectory_role_rewards[(trajectory.trajectory_id, character)]
+                for trajectory in trajectories
+            ]
+            if any(value != values[0] for value in values[1:]):
+                return True
+        return False
+
     async def _score_group_at_step(self, state: _GroupState) -> None:
         try:
             reward_step = state.reward_step
@@ -373,13 +449,6 @@ class RLFFGroupAwareAgent:
             )
             trajectories = tuple(state.trajectories[index] for index in range(state.expected))
             provider = self._get_reward_provider()
-            completion_payloads = [
-                self._proxy_completion_payload(trajectory, character)
-                for trajectory in trajectories
-                for character in dict.fromkeys(
-                    completion.character for completion in trajectory.completions
-                )
-            ]
             trajectory_role_payloads = [
                 self._proxy_trajectory_payload(trajectory, character)
                 for trajectory in trajectories
@@ -387,20 +456,87 @@ class RLFFGroupAwareAgent:
                     completion.character for completion in trajectory.completions
                 )
             ]
-            completion_values, trajectory_values = await asyncio.gather(
-                asyncio.gather(
-                    *(
-                        provider.score_proxy_completion_role(payload)
-                        for payload in completion_payloads
-                    )
-                ),
-                asyncio.gather(
+            completion_payloads: list[Mapping[str, Any]] | None = None
+            completion_values: Sequence[Mapping[str, float]] | None = None
+            if self.dynamic_trajectory_resampling:
+                trajectory_values = await asyncio.gather(
                     *(
                         provider.score_proxy_trajectory_role(payload)
                         for payload in trajectory_role_payloads
                     )
-                ),
-            )
+                )
+            else:
+                # Preserve the original single-epoch latency behavior when
+                # dynamic filtering is disabled: both scopes run in parallel.
+                completion_payloads = [
+                    self._proxy_completion_payload(trajectory, character)
+                    for trajectory in trajectories
+                    for character in dict.fromkeys(
+                        completion.character for completion in trajectory.completions
+                    )
+                ]
+                completion_values, trajectory_values = await asyncio.gather(
+                    asyncio.gather(
+                        *(
+                            provider.score_proxy_completion_role(payload)
+                            for payload in completion_payloads
+                        )
+                    ),
+                    asyncio.gather(
+                        *(
+                            provider.score_proxy_trajectory_role(payload)
+                            for payload in trajectory_role_payloads
+                        )
+                    ),
+                )
+            trajectory_role_rewards = {
+                (
+                    str(payload["ids"]["trajectory_id"]),
+                    str(payload["ids"]["character"]),
+                ): float(value)
+                for payload, value in zip(
+                    trajectory_role_payloads,
+                    trajectory_values,
+                    strict=True,
+                )
+            }
+
+            if self.dynamic_trajectory_resampling and not (
+                self._trajectory_rewards_are_informative(
+                    trajectory_role_rewards,
+                    trajectories,
+                )
+            ):
+                await self._publish_group_sampling_decision(state, accepted=False)
+                rejected = {
+                    completion.completion_id: 0.0
+                    for trajectory in trajectories
+                    for completion in trajectory.completions
+                }
+                logger.info(
+                    "RLFF trajectory-first filter rejected proxy group %s; "
+                    "completion rewards were not requested",
+                    state.key,
+                )
+                if not state.future.done():
+                    state.future.set_result(rejected)
+                return
+
+            if completion_payloads is None:
+                completion_payloads = [
+                    self._proxy_completion_payload(trajectory, character)
+                    for trajectory in trajectories
+                    for character in dict.fromkeys(
+                        completion.character for completion in trajectory.completions
+                    )
+                ]
+            if completion_values is None:
+                completion_values = await asyncio.gather(
+                    *(
+                        provider.score_proxy_completion_role(payload)
+                        for payload in completion_payloads
+                    )
+                )
             completion_rewards: dict[str, float] = {}
             for values in completion_values:
                 for completion_id, value in values.items():
@@ -408,13 +544,6 @@ class RLFFGroupAwareAgent:
                     if key in completion_rewards:
                         raise ProxyGroupError(f"duplicate completion reward {key!r}")
                     completion_rewards[key] = float(value)
-            trajectory_role_rewards = {
-                (
-                    str(payload["ids"]["trajectory_id"]),
-                    str(payload["ids"]["character"]),
-                ): float(value)
-                for payload, value in zip(trajectory_role_payloads, trajectory_values, strict=True)
-            }
             result = normalize_proxy_role_advantages(
                 trajectories,
                 completion_rewards,
@@ -424,6 +553,8 @@ class RLFFGroupAwareAgent:
                 min_group_size=self.min_group_size,
                 reward_std_epsilon=self.reward_std_epsilon,
             )
+            if self.dynamic_trajectory_resampling:
+                await self._publish_group_sampling_decision(state, accepted=True)
             if not state.future.done():
                 logger.info(
                     "RLFF reward weights global_step=%d completion=%.6f trajectory=%.6f",
