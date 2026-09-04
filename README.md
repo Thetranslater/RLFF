@@ -1,9 +1,4 @@
-# RLFF Phase-D cloud bundle
-
-> Source of truth: this deployment's `src/rlff` directory is the only maintained
-> RLFF training implementation. The repository-level `src/rlff` tree is legacy
-> and is not synchronized. See [`src/rlff/ARCHITECTURE.md`](src/rlff/ARCHITECTURE.md)
-> for the responsibility-based module layout.
+# RLFF Phase-D 
 
 This directory is the self-contained transfer root for the first RLFF training run.
 Run every command from this directory so all relative paths in `configs/` resolve
