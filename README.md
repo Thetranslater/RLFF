@@ -117,8 +117,7 @@ asymmetric clipping (`eps_clip=0.2`, `eps_clip_higher=0.28`). The ordered
 dataset uses a stable mixed curriculum: the first 100 records contain 70 easy
 and 30 normal/difficult episodes; the last 100 contain 30 easy and 70
 normal/difficult episodes. Each half distributes both classes throughout the
-sequence while preserving the original relative order inside each class. No
-episode content or per-record fingerprint is changed.
+sequence while preserving the original relative order inside each class. 
 
 Use this configuration only from the exact first-epoch boundary (the recovery
 record whose next global step is 200). AReaL restores the stateful dataloader
@@ -134,17 +133,6 @@ entire group is discarded and the same episode is sampled again with no
 attempt limit. Completion-role rewards are requested only after at least one
 character has differing trajectory rewards. Rejected interactions therefore
 never enter AReaL's training batch and do not consume completion-reward calls.
-
-Both RLFF configurations enable a conservative completion-advantage gate after
-role-level GRPO normalization. A completion with reward at or below `2.5`
-cannot inherit a positive role advantage. A completion at or above `4.5` is
-protected from a negative role advantage only when the same trajectory/role
-contains at least three bad completions, bad-completion density is at least
-`0.6`, and bad completions outnumber good completions by at least `2:1`.
-Filtered completions receive scalar advantage zero, so their generated tokens
-contribute no direct policy-gradient update. The original completion loss mask
-is retained to preserve AReaL's native interaction schema and audit tooling.
-Every enabled group logs aggregate gate counts for later diagnosis.
 `src/script/build/sync_cloud_bundle.py` in the main repository refreshes copied code,
 prompts, packaging files, tests, and the 200-row dataset without touching model weights
 or cloud outputs.
